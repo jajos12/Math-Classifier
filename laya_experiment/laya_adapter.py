@@ -6,7 +6,10 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
-from maths_ai.gnn_inference.atp_lean_gnn.state import parse_state
+try:
+    from maths_ai.gnn_inference.atp_lean_gnn.state import parse_state
+except ImportError:
+    from .graph import parse_state
 
 from .tactic_choose import TACTIC_SET
 

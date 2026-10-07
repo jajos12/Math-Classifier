@@ -79,3 +79,7 @@ class ExperimentConfig:
     def prepare_directories(self) -> None:
         for path in (self.model_dir, self.dataset_dir, self.resolved_cache_dir, self.resolved_output_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def cache_path(self) -> Path:
+        return self.resolved_cache_dir / f"{self.split}_{self.n_rows}_seed{self.seed}_k{self.pool_k}.json"

@@ -64,6 +64,16 @@ _TOKEN_RE = re.compile(
     r"(?P<AT>@)|(?P<COLON>:)|"
     r"(?P<IDENT>[^\s()→@\[\]\u27e8\u27e9,;:]+)"
 )
+TACTIC_TOKEN_RE = re.compile(r"[A-Za-z0-9_.'!?]+")
+
+
+def normalize_tactic(raw: str) -> str:
+    """Return the first tactic token from a tactic application."""
+    text = raw.strip()
+    if not text:
+        return "<EMPTY_TACTIC>"
+    match = TACTIC_TOKEN_RE.search(text)
+    return match.group(0) if match else "<EMPTY_TACTIC>"
 
 
 class ExprParser:

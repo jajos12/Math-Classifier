@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
+import json
+from pathlib import Path
 
 
 def rank_of(target: str, ranking: Sequence[str]) -> int | None:
@@ -56,3 +58,44 @@ def transition_table(
         "neither": sum((not a) and (not b) for a, b in zip(reference_ok, candidate_ok)) / total,
         "n": total,
     }
+
+
+def build_report(
+    gnn_rankings: Sequence[Sequence[str]],
+    laya_rankings: Sequence[Sequence[str]],
+    targets: Sequence[str],
+    *,
+    pool_k: int = 10,
+    select_k: int = 5,
+) -> dict[str, Any]:
+    """Build the paired report used by the benchmark CLI."""
+    known = [not target.startswith("<") for target in targets]
+    in_pool = [known[i] and targets[i] in gnn_rankings[i][:pool_k] for i in range(len(targets))]
+    systems = {
+        "gnn": gnn_rankings,
+        "laya": laya_rankings,
+    }
+    metrics = {
+        name: {
+            **evaluate_rankings(ranking, targets, known, ks=(pool_k, select_k, 1), mrr_k=pool_k),
+            "conditional": evaluate_rankings(ranking, targets, in_pool, ks=(select_k, 1), mrr_k=pool_k),
+        }
+        for name, ranking in systems.items()
+    }
+    return {
+        "rows": len(targets),
+        "known_targets": sum(known),
+        "pool_rows": sum(in_pool),
+        "pool_recall": sum(in_pool) / max(sum(known), 1),
+        "metrics": metrics,
+        "transitions": {
+            f"top_{k}": transition_table(gnn_rankings, laya_rankings, targets, known, k=k)
+            for k in (1, select_k)
+        },
+    }
+
+
+def write_report(report: dict[str, Any], path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return path

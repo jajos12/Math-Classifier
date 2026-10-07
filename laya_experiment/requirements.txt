@@ -1,9 +1,9 @@
+# Install a matching Torch build before this file.
 numpy
 pandas
 pyarrow
 matplotlib
 tqdm
-scikit-learn
 huggingface_hub
 safetensors
-transformers>=4.48,<5
+torch-geometric>=2.5
