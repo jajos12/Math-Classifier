@@ -93,6 +93,109 @@ Use a GPU runtime for the full benchmark. Start with a small run:
 
 Only after the smoke run succeeds, increase `--rows` to 500 or more.
 
+The CLI accepts a specific GPU index. List the devices visible to the current
+Python environment:
+
+```bash
+python3 pipeline.py devices
+```
+
+Select GPU 0 or GPU 1 explicitly:
+
+```bash
+python3 pipeline.py benchmark --rows 20 --device cuda:0
+python3 pipeline.py benchmark --rows 20 --device cuda:1
+```
+
+By default, Laya uses the same device as the GNN. To place them separately,
+set `--laya-device` explicitly:
+
+```bash
+python3 pipeline.py benchmark \
+    --rows 500 \
+    --device cuda:0 \
+    --laya-device cuda:1
+```
+
+CPU and automatic selection are also supported:
+
+```bash
+python3 pipeline.py benchmark --rows 20 --device cpu
+python3 pipeline.py benchmark --rows 20 --device auto
+```
+
+Run commands from the `Math-Classifier` repository root. In a Colab notebook,
+prefix the same commands with `!`; in a normal terminal, do not use `!`.
+
+## SSH server and Jupyter runtime selection
+
+On an SSH server, `python3`, the Python used by Jupyter, and the Python used
+by a shell may be different environments. Install and run the project with the
+same interpreter that you intend to use:
+
+```bash
+cd /path/to/Math-Classifier
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -r requirements-laya.txt
+```
+
+Check the exact runtime before downloading data or running a benchmark:
+
+```bash
+python pipeline.py runtime
+python pipeline.py devices
+```
+
+`runtime` prints the Python executable, Python version, Torch version,
+`CUDA_VISIBLE_DEVICES`, and the GPU indices visible to that interpreter.
+Always use the printed interpreter for package installation:
+
+```bash
+/path/to/Math-Classifier/.venv/bin/python -m pip install -e .
+/path/to/Math-Classifier/.venv/bin/python pipeline.py runtime
+```
+
+If you use Jupyter, register that same environment as a kernel:
+
+```bash
+python -m pip install ipykernel
+python -m ipykernel install --user \
+    --name math-classifier \
+    --display-name "Math Classifier (.venv)"
+```
+
+Select `Math Classifier (.venv)` as the notebook kernel. In a notebook, verify
+that the kernel and shell point to the same Python:
+
+```python
+import sys
+print(sys.executable)
+```
+
+Then run the CLI with that interpreter:
+
+```python
+!{sys.executable} pipeline.py runtime
+!{sys.executable} pipeline.py devices
+!{sys.executable} pipeline.py benchmark --rows 20 --device cuda:0
+```
+
+GPU numbering is affected by `CUDA_VISIBLE_DEVICES`. If the server exposes
+only physical GPU 1 with `CUDA_VISIBLE_DEVICES=1`, it appears to PyTorch as
+`cuda:0`. Use the indices printed by `pipeline.py devices`, not the physical
+machine numbering. You can also choose separate devices:
+
+```bash
+python pipeline.py benchmark \
+    --rows 500 \
+    --device cuda:0 \
+    --laya-device cuda:1
+```
+
 ## Benchmark
 
 The default sources are the same links used by the notebook:
@@ -135,45 +238,145 @@ tree. The command is intentionally explicit about failures: missing optional
 packages, invalid model hashes, malformed states, and invalid Laya responses
 stop the run instead of producing incomplete benchmark numbers.
 
-## Training-data preparation
+## Laya retraining
 
-The stable part of Laya retraining is translating and validating the Lean
-dataset. Input rows need `text_state` and `tactic`; they may also contain
-`row_index`, `theorem`, and a `candidates` list.
+The retraining command prepares Lean examples in the format consumed by a Laya
+trainer. It does not silently fine-tune a model: the project first translates
+and validates the data, then optionally calls a trainer supplied with
+`--trainer module:function`.
+
+### 1. Download the training data
+
+The repository intentionally does not contain the Hugging Face dataset. From
+the repository root, download the `train` parquet shards:
 
 ```bash
-python laya_retrain.py \
+python3 - <<'PY'
+from pathlib import Path
+from data import download_dataset
+
+paths = download_dataset(
+    "jajostrains/Mathlib-Normalized-Sexpr",
+    "train",
+    Path("data/Mathlib-Normalized-Sexpr"),
+)
+
+for path in paths:
+    print(path)
+PY
+```
+
+If Hugging Face reports rate limits, configure a token before downloading:
+
+```bash
+export HF_TOKEN="your-hugging-face-token"
+```
+
+Do not commit the token. The dataset is ignored by `.gitignore`.
+
+### 2. Create one parquet input file
+
+`laya_retrain.py` accepts parquet, JSONL, JSON, or CSV. If the download
+produced multiple parquet shards, combine them into the path used below:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import pandas as pd
+
+paths = sorted(Path("data/Mathlib-Normalized-Sexpr").rglob("*.parquet"))
+if not paths:
+    raise SystemExit("No parquet shards found.")
+
+frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
+output = Path("data/train.parquet")
+output.parent.mkdir(parents=True, exist_ok=True)
+frame.to_parquet(output, index=False)
+
+print(f"Wrote {len(frame)} rows to {output}")
+print("Columns:", ", ".join(frame.columns))
+PY
+```
+
+The input must contain at least:
+
+```text
+text_state
+tactic
+```
+
+The optional `row_index`, `theorem`, and `candidates` columns are also
+supported. If the dataset already exists elsewhere, use its actual path
+instead of `data/train.parquet`; the file is not created by cloning the repo.
+
+### 3. Prepare and preview the Laya records
+
+Run this from `/content/Math-Classifier` in Colab or from the local repository
+root:
+
+```bash
+python3 laya_retrain.py \
     data/train.parquet \
     outputs/laya_train.jsonl \
-    --candidates rw,simp,exact,apply,assumption \
+    --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
     --preview
 ```
 
-Each record retains `raw_state`, translated `state`, candidate criteria, the
-original tactic application, the normalized target tactic, a tactic description,
-and an audit tag. Use `--preview` to inspect exactly what Laya will receive
-before training. A server-specific Laya trainer can
-be invoked through the existing `module:function` hook:
+The command writes `outputs/laya_train.jsonl` and prints the first record.
+The preview is useful for checking that the dataset columns and state parser
+are correct before processing the complete dataset.
+
+Each record contains:
+
+- `raw_state`: the original Lean proof state.
+- `state`: a structured description with `CURRENT GOAL`, `LOCAL HYPOTHESES`,
+  and a `TASK` section.
+- `questions.tactic.instructions`: the shared proof-state reasoning prompt.
+- `questions.tactic.criteria`: descriptions of the candidate tactic actions.
+- `expected.application`: the original tactic application, such as `rw [h]`.
+- `expected.tactic`: the normalized tactic family, such as `rw`.
+- `metadata`: candidate order, candidate count, and prompt version.
+
+The translated state preserves Lean identifiers and expressions while expanding
+common logical symbols into readable phrases. This gives Laya both exact names
+and a clearer description of how the goal relates to the local hypotheses.
+
+### 4. Run an actual trainer
+
+The repository does not assume a particular Laya fine-tuning API because that
+API can differ between Laya versions. To fine-tune, provide a Python module
+with a callable named `train`:
+
+```python
+# my_trainer.py
+def train(records, output_path):
+    # Connect this stable record format to the Laya training API
+    # for the installed Laya version.
+    ...
+```
+
+Then run:
 
 ```bash
-python laya_retrain.py \
-    data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py \
+    data/train.parquet \
+    outputs/laya_train.jsonl \
+    --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
     --trainer my_trainer:train
 ```
 
-The callable receives `records=...` and `output_path=...`. This boundary is
-deliberate because Laya training APIs differ between package/checkpoint
-versions; the experiment's data format remains stable.
+The callable receives `records=...` and `output_path=...`. Without
+`--trainer`, the command only creates and validates the training JSONL,
+which is the expected behavior.
 
-### Prompt and descriptions
+### Prompt and candidate descriptions
 
-The shared prompt tells Laya to read `GOAL` before `CONTEXT`, select exactly one
-listed candidate, judge the tactic family rather than inventing arguments, and
-use the operation description. Candidate descriptions are generated by the same
-catalog used during inference and training, so the two paths cannot silently
-disagree. Original arguments are retained in `expected.application` for
-supervision and auditing, while the class label remains the normalized tactic
-family.
+Inference and retraining use the same prompt and tactic-description catalog.
+The prompt asks Laya to analyze the current goal together with local
+hypotheses and identify the proof action that best advances that state.
+Descriptions explain operations such as rewriting, applying a hypothesis,
+simplifying, destructuring, introducing variables, or solving arithmetic.
+Use `--instructions "..."` if you need to test a different prompt.
 
 ## Important implementation details
 

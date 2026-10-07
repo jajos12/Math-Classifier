@@ -45,6 +45,19 @@ class ExperimentConfig:
             raise ValueError("select_k must be between 1 and pool_k")
         if self.batch_size < 1 or self.checkpoint_every < 1:
             raise ValueError("batch_size and checkpoint_every must be positive")
+        self._validate_device(self.device, "device")
+        self._validate_device(self.laya_device, "laya-device")
+
+    @staticmethod
+    def _validate_device(value: str, name: str) -> None:
+        if value in {"auto", "cpu"} or value == "cuda":
+            return
+        if value.startswith("cuda:") and value[5:].isdigit():
+            return
+        raise ValueError(
+            f"invalid {name} {value!r}; use auto, cpu, cuda, or cuda:N "
+            "(for example cuda:0 or cuda:1)"
+        )
 
     @property
     def model_dir(self) -> Path:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import sys
 
 from config import ExperimentConfig
 from data import download_dataset, load_dataset, sample_dataset
@@ -18,10 +20,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Math Classifier GNN/Laya experiment")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("validate", help="run a dependency-free graph smoke test")
+    subparsers.add_parser("devices", help="list available Torch devices")
+    subparsers.add_parser(
+        "runtime",
+        help="show the Python environment, Torch, CUDA, and visible GPUs",
+    )
     benchmark = subparsers.add_parser("benchmark", help="run GNN and Laya ranking evaluation")
-    benchmark.add_argument("--rows", type=int, default=500)
+    benchmark.add_argument("--rows", type=int, default=500, help="number of rows to evaluate")
     benchmark.add_argument("--seed", type=int, default=42)
-    benchmark.add_argument("--device", default="auto")
+    benchmark.add_argument(
+        "--device",
+        default="auto",
+        metavar="DEVICE",
+        help="GNN device: auto, cpu, cuda, cuda:0, cuda:1, ... (default: auto)",
+    )
+    benchmark.add_argument(
+        "--laya-device",
+        default="auto",
+        metavar="DEVICE",
+        help="Laya device; defaults to the GNN --device selection",
+    )
     benchmark.add_argument("--work-dir", type=Path, default=Path.cwd())
     return parser
 
@@ -33,8 +51,42 @@ def main(argv: list[str] | None = None) -> int:
         if not any(node.label == "State" for node in dag.nodes):
             raise RuntimeError("graph smoke test did not create a State node")
         print(f"graph validation passed: {dag.num_nodes} nodes, {dag.num_edges} edges")
+    elif args.command == "devices":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("Torch is required to list runtime devices") from exc
+        print("cpu")
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                print(f"cuda:{index} ({torch.cuda.get_device_name(index)})")
+        else:
+            print("CUDA is not available")
+    elif args.command == "runtime":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "Torch is not installed in this Python environment. "
+                "Activate the intended environment or select the matching Jupyter kernel."
+            ) from exc
+        print(f"python: {sys.executable}")
+        print(f"python_version: {sys.version.split()[0]}")
+        print(f"torch: {torch.__version__}")
+        print(f"cuda_available: {torch.cuda.is_available()}")
+        print(f"cuda_visible_devices: {os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')}")
+        if torch.cuda.is_available():
+            print(f"cuda_device_count: {torch.cuda.device_count()}")
+            for index in range(torch.cuda.device_count()):
+                print(f"cuda:{index}: {torch.cuda.get_device_name(index)}")
     elif args.command == "benchmark":
-        config = ExperimentConfig(n_rows=args.rows, seed=args.seed, device=args.device, work_dir=args.work_dir)
+        config = ExperimentConfig(
+            n_rows=args.rows,
+            seed=args.seed,
+            device=args.device,
+            laya_device=args.laya_device,
+            work_dir=args.work_dir,
+        )
         config.prepare_directories()
         paths = download_dataset(config.dataset_repo, config.split, config.dataset_dir)
         frame = sample_dataset(load_dataset(paths), config.n_rows, config.seed)
