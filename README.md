@@ -117,6 +117,31 @@ python3 pipeline.py benchmark \
     --laya-device cuda:1
 ```
 
+Laya can use standard scoring or balanced scoring. Balanced mode evaluates
+rotated candidate orders and averages the probabilities, which reduces
+candidate-position bias but requires more Laya calls:
+
+```bash
+python3 pipeline.py benchmark \
+    --rows 100 \
+    --device cuda:0 \
+    --laya-device cuda:0 \
+    --laya-mode balanced
+```
+
+To keep the GNN ranking when Laya is uncertain, add a confidence threshold.
+The threshold is disabled when it is `0`:
+
+```bash
+python3 pipeline.py benchmark \
+    --rows 500 \
+    --device cuda:0 \
+    --laya-confidence-threshold 0.60
+```
+
+The benchmark records the selected mode, confidence values, and number of
+GNN fallbacks in `outputs/metrics.json` and `outputs/predictions.json`.
+
 CPU and automatic selection are also supported:
 
 ```bash

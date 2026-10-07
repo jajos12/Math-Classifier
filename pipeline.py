@@ -40,6 +40,19 @@ def _parser() -> argparse.ArgumentParser:
         metavar="DEVICE",
         help="Laya device; defaults to the GNN --device selection",
     )
+    benchmark.add_argument(
+        "--laya-mode",
+        choices=("standard", "balanced"),
+        default="standard",
+        help="Laya scoring mode; balanced removes candidate-order bias but is slower",
+    )
+    benchmark.add_argument(
+        "--laya-confidence-threshold",
+        type=float,
+        default=0.0,
+        metavar="P",
+        help="keep the GNN order when Laya top probability is below P (default: disabled)",
+    )
     benchmark.add_argument("--work-dir", type=Path, default=Path.cwd())
     return parser
 
@@ -85,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             device=args.device,
             laya_device=args.laya_device,
+            laya_mode=args.laya_mode,
+            laya_confidence_threshold=args.laya_confidence_threshold,
             work_dir=args.work_dir,
         )
         config.prepare_directories()
@@ -104,18 +119,42 @@ def main(argv: list[str] | None = None) -> int:
             instructions=config.laya_instructions,
         )
         laya_rankings = []
+        laya_confidences = []
+        laya_fallbacks = 0
         for state, candidates in zip(frame["text_state"], gnn_rankings):
-            laya_rankings.append(adapter.predict(str(state), candidates)["order"])
+            if config.laya_mode == "balanced":
+                result = adapter.balanced_predict(str(state), candidates)
+            else:
+                result = adapter.predict(str(state), candidates)
+            confidence = float(result.get("answer_confidence", 0.0))
+            if confidence < config.laya_confidence_threshold:
+                laya_rankings.append(list(candidates))
+                laya_fallbacks += 1
+            else:
+                laya_rankings.append(result["order"])
+            laya_confidences.append(confidence)
         targets = frame["tactic"].map(normalize_tactic).tolist()
         report = build_report(
             gnn_rankings, laya_rankings, targets,
             pool_k=config.pool_k, select_k=config.select_k,
         )
         report["pool_k"] = config.pool_k
+        report["laya_mode"] = config.laya_mode
+        report["laya_confidence_threshold"] = config.laya_confidence_threshold
+        report["laya_fallbacks"] = laya_fallbacks
         output = write_report(report, config.resolved_output_dir / "metrics.json")
         image = write_metrics_image(report, config.resolved_output_dir / "metrics.png")
         (config.resolved_output_dir / "predictions.json").write_text(
-            json.dumps({"targets": targets, "gnn": gnn_rankings, "laya": laya_rankings, "gnn_scores": gnn_scores}, indent=2),
+            json.dumps(
+                {
+                    "targets": targets,
+                    "gnn": gnn_rankings,
+                    "laya": laya_rankings,
+                    "laya_confidences": laya_confidences,
+                    "gnn_scores": gnn_scores,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
         print(f"benchmark complete: {output}")

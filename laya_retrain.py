@@ -106,7 +106,9 @@ def build_training_record(
     return {
         "state": translated_state,
         "raw_state": raw_state,
-        "questions": {"tactic": choice_question(option_list, instructions)["tactic"]},
+        "questions": {
+            "tactic": choice_question(option_list, instructions, raw_state)["tactic"]
+        },
         "expected": {
             "tactic": target,
             "application": raw_tactic,

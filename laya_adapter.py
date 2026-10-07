@@ -125,7 +125,9 @@ def translate_lean_state(text_state: str) -> str:
     goal = translate_lean_statement(parsed.goal)
     if parsed.hypotheses:
         context_lines = [
-            f"- {hypothesis.name}: {translate_lean_statement(hypothesis.type_expr)}"
+            f"- {hypothesis.name}\n"
+            f"  Readable: {translate_lean_statement(hypothesis.type_expr)}\n"
+            f"  Lean: {hypothesis.name} : {hypothesis.type_expr}"
             for hypothesis in parsed.hypotheses
         ]
         context = "\n".join(context_lines)
@@ -134,7 +136,8 @@ def translate_lean_state(text_state: str) -> str:
     return (
         "PROOF STATE\n"
         "CURRENT GOAL\n"
-        f"{goal}\n"
+        f"Readable: {goal}\n"
+        f"Lean: {parsed.goal}\n"
         "LOCAL HYPOTHESES\n"
         f"{context}\n"
         "TASK\n"
@@ -150,24 +153,63 @@ def laya_state(text_state: str) -> str:
 def choice_question(
     candidates: Sequence[str],
     instructions: str = DEFAULT_INSTRUCTIONS,
+    text_state: str | None = None,
 ) -> dict[str, Any]:
     """Build the documented Laya choice-question payload."""
     if not candidates:
         raise ValueError("choice questions need at least one candidate")
+    state_hints = _state_hints(text_state) if text_state else {}
     return {
         "tactic": {
             "type": "choice",
             "instructions": instructions,
             "criteria": {
-                candidate: translate_tactic_step(candidate).removesuffix(".")
+                candidate: _candidate_description(candidate, state_hints)
                 for candidate in candidates
             },
         }
     }
 
 
+def _state_hints(text_state: str) -> dict[str, Any]:
+    parsed = parse_state(text_state)
+    goal = parsed.goal
+    context = " ".join(hypothesis.type_expr for hypothesis in parsed.hypotheses)
+    return {
+        "goal": goal,
+        "context": context,
+        "hypotheses": parsed.hypotheses,
+        "has_equality": "=" in goal or any("=" in h.type_expr for h in parsed.hypotheses),
+        "has_arithmetic": bool(re.search(r"\b(?:Nat|Int)\b|[0-9]|[<>≤≥]", goal + context)),
+        "has_implication": "→" in goal or "->" in goal,
+        "has_existential": "∃" in goal,
+        "has_conjunction": "∧" in goal,
+    }
+
+
+def _candidate_description(candidate: str, hints: Mapping[str, Any]) -> str:
+    description = translate_tactic_step(candidate).removesuffix(".")
+    if not hints:
+        return description
+    additions: list[str] = []
+    if candidate in {"rw", "rwa", "nth_rewrite", "subst"} and hints["has_equality"]:
+        additions.append("The state contains equality information that may be useful here.")
+    if candidate in {"linarith", "nlinarith", "norm_num", "omega", "ring", "ring_nf"} and hints["has_arithmetic"]:
+        additions.append("The goal or context contains arithmetic-looking expressions.")
+    if candidate in {"intro", "intros"} and hints["has_implication"]:
+        additions.append("The goal begins with an implication or binder.")
+    if candidate in {"use", "exists"} and hints["has_existential"]:
+        additions.append("The goal is existential and needs a witness.")
+    if candidate in {"constructor", "split"} and hints["has_conjunction"]:
+        additions.append("The goal contains a conjunction or structured target.")
+    return f"{description}. {' '.join(additions)}".strip()
+
+
 def rotated_choice_question(
-    candidates: Sequence[str], instructions: str, rotation: int
+    candidates: Sequence[str],
+    instructions: str,
+    rotation: int,
+    text_state: str | None = None,
 ) -> dict[str, Any]:
     """Build a rotated question and retain the rotation metadata for auditing."""
     if not candidates:
@@ -175,7 +217,7 @@ def rotated_choice_question(
     offset = rotation % len(candidates)
     order = list(range(offset, len(candidates))) + list(range(offset))
     rotated = [candidates[index] for index in order]
-    question = choice_question(rotated, instructions)
+    question = choice_question(rotated, instructions, text_state)
     question["tactic"]["option_order"] = order
     return question
 
@@ -209,7 +251,7 @@ class LayaAdapter:
 
     def predict(self, text_state: str, candidates: Sequence[str]) -> dict[str, Any]:
         candidate_list = list(candidates)
-        question = choice_question(candidate_list, self.instructions)
+        question = choice_question(candidate_list, self.instructions, text_state)
         result = self.agent.predict(laya_state(text_state), question)
         try:
             answer = result["answers"]["tactic"]
@@ -230,7 +272,7 @@ class LayaAdapter:
         candidate_list = list(candidates)
         totals = {candidate: 0.0 for candidate in candidate_list}
         for rotation in range(len(candidate_list)):
-            question = rotated_choice_question(candidate_list, self.instructions, rotation)
+            question = rotated_choice_question(candidate_list, self.instructions, rotation, text_state)
             result = self.agent.predict(laya_state(text_state), question)
             probabilities = result["answers"]["tactic"]["probabilities"]
             if set(probabilities) != set(candidate_list):
@@ -238,4 +280,4 @@ class LayaAdapter:
             for candidate in candidate_list:
                 totals[candidate] += float(probabilities[candidate]) / len(candidate_list)
         order = sorted(candidate_list, key=lambda candidate: (-totals[candidate], candidate))
-        return {"order": order, "probabilities": totals}
+        return {"order": order, "probabilities": totals, "answer_confidence": max(totals.values(), default=0.0)}

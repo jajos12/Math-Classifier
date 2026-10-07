@@ -31,6 +31,8 @@ class ExperimentConfig:
     output_dir: Path | None = None
     device: str = "auto"
     laya_device: str = "auto"
+    laya_mode: str = "standard"
+    laya_confidence_threshold: float = 0.0
     run_b1: bool = False
     run_b2: bool = False
     run_multilingual: bool = False
@@ -47,6 +49,10 @@ class ExperimentConfig:
             raise ValueError("batch_size and checkpoint_every must be positive")
         self._validate_device(self.device, "device")
         self._validate_device(self.laya_device, "laya-device")
+        if self.laya_mode not in {"standard", "balanced"}:
+            raise ValueError("laya-mode must be standard or balanced")
+        if not 0.0 <= self.laya_confidence_threshold <= 1.0:
+            raise ValueError("laya-confidence-threshold must be between 0 and 1")
 
     @staticmethod
     def _validate_device(value: str, name: str) -> None:
