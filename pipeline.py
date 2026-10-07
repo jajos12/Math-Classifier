@@ -6,12 +6,12 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import ExperimentConfig
-from .data import download_dataset, load_dataset, sample_dataset
-from .evaluation import build_report, write_report
-from .graph import normalize_tactic, proof_state_to_dag
-from .gnn import build_graphs, build_model, download_bundle, load_bundle, predict_top_k
-from .laya_adapter import LayaAdapter
+from config import ExperimentConfig
+from data import download_dataset, load_dataset, sample_dataset
+from evaluation import build_report, write_report
+from graph import normalize_tactic, proof_state_to_dag
+from gnn import build_graphs, build_model, download_bundle, load_bundle, predict_top_k
+from laya_adapter import LayaAdapter
 
 
 def _parser() -> argparse.ArgumentParser:

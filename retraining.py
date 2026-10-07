@@ -1,6 +1,6 @@
 """Public retraining interface for the experiment."""
 
-from .laya_retrain import (
+from laya_retrain import (
     RetrainConfig,
     build_training_record,
     prepare_dataset,

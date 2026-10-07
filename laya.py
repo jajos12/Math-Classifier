@@ -1,6 +1,6 @@
 """Public Laya interface for the experiment."""
 
-from .laya_adapter import (
+from laya_adapter import (
     LayaAdapter,
     LayaUnavailableError,
     choice_question,

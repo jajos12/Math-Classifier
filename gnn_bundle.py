@@ -18,7 +18,7 @@ from torch_geometric.data import Batch
 from torch_geometric.nn import GATv2Conv, global_add_pool, global_max_pool, global_mean_pool
 from torch_geometric.utils import softmax as graph_softmax
 
-from .graph import NODE_TYPE_TO_ID, root_state_node_index
+from graph import NODE_TYPE_TO_ID, root_state_node_index
 
 
 class StateMeanAttentionReadout(nn.Module):

@@ -17,13 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .laya_adapter import (
+from laya_adapter import (
     choice_question,
     translate_lean_state,
     translate_tactic_step,
 )
-from .graph import normalize_tactic
-from .tactic_choose import validate_tactic_names
+from graph import normalize_tactic
+from tactic_choose import validate_tactic_names
 
 LAYA_RETRAIN_INSTRUCTIONS = "Which Lean 4 tactic family best matches this proof step?"
 

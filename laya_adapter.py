@@ -9,9 +9,9 @@ from typing import Any
 try:
     from maths_ai.gnn_inference.atp_lean_gnn.state import parse_state
 except ImportError:
-    from .graph import parse_state
+    from graph import parse_state
 
-from .tactic_choose import TACTIC_SET
+from tactic_choose import TACTIC_SET
 
 DEFAULT_GLOSS = "Lean 4 tactic"
 TACTIC_GLOSS: dict[str, str] = {

@@ -14,5 +14,9 @@ dependencies = [
   "huggingface_hub",
 ]
 
-[tool.setuptools.packages.find]
-include = ["laya_experiment*"]
+[tool.setuptools]
+py-modules = [
+  "config", "data", "evaluation", "gnn", "gnn_bundle", "graph",
+  "laya", "laya_adapter", "laya_retrain", "pipeline", "retraining",
+  "tactic_choose",
+]

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .graph import DAGBuilder, dag_to_pyg, proof_state_to_dag
+from graph import DAGBuilder, dag_to_pyg, proof_state_to_dag
 
 
 def download_bundle(repo: str, bundle_name: str, directory: Path) -> Path:
@@ -28,12 +28,12 @@ def download_bundle(repo: str, bundle_name: str, directory: Path) -> Path:
 
 
 def load_bundle(bundle_dir: str | Path, *, verify_hashes: bool = True):
-    from .gnn_bundle import load_bundle as loader
+    from gnn_bundle import load_bundle as loader
     return loader(bundle_dir, verify_hashes=verify_hashes)
 
 
 def build_model(bundle, *, strict: bool = True):
-    from .gnn_bundle import build_model as builder
+    from gnn_bundle import build_model as builder
     return builder(bundle, strict=strict)
 
 
@@ -45,6 +45,6 @@ def build_graphs(states: list[str], bundle, *, edge_mode: str = "bidirectional")
 
 
 def predict_top_k(model, graphs, bundle, k: int, *, batch_size: int = 64, device: str = "cpu"):
-    from .gnn_bundle import predict_probs, topk_predictions
+    from gnn_bundle import predict_probs, topk_predictions
     probabilities = predict_probs(model, graphs, batch_size=batch_size, device=device)
     return topk_predictions(probabilities, bundle, k)
