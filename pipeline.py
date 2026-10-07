@@ -8,7 +8,7 @@ from pathlib import Path
 
 from config import ExperimentConfig
 from data import download_dataset, load_dataset, sample_dataset
-from evaluation import build_report, write_report
+from evaluation import build_report, print_summary, write_metrics_image, write_report
 from graph import normalize_tactic, proof_state_to_dag
 from gnn import build_graphs, build_model, download_bundle, load_bundle, predict_top_k
 from laya_adapter import LayaAdapter
@@ -59,12 +59,15 @@ def main(argv: list[str] | None = None) -> int:
             gnn_rankings, laya_rankings, targets,
             pool_k=config.pool_k, select_k=config.select_k,
         )
+        report["pool_k"] = config.pool_k
         output = write_report(report, config.resolved_output_dir / "metrics.json")
+        image = write_metrics_image(report, config.resolved_output_dir / "metrics.png")
         (config.resolved_output_dir / "predictions.json").write_text(
             json.dumps({"targets": targets, "gnn": gnn_rankings, "laya": laya_rankings, "gnn_scores": gnn_scores}, indent=2),
             encoding="utf-8",
         )
         print(f"benchmark complete: {output}")
+        print_summary(report, image)
     return 0
 
 

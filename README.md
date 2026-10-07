@@ -121,7 +121,14 @@ reranks the same top-10 candidates with Laya, and writes:
 ```text
 outputs/metrics.json
 outputs/predictions.json
+outputs/metrics.png
 ```
+
+The command also prints a performance summary at the end. Open
+`outputs/metrics.png` for a visual comparison of GNN and Laya recall,
+conditional recall, and top-1 corrections/regressions. The JSON files remain
+available for detailed inspection, but they are not required to understand the
+main result.
 
 Use `--work-dir /path/to/run` to keep downloads and results outside the source
 tree. The command is intentionally explicit about failures: missing optional
