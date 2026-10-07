@@ -17,6 +17,6 @@ dependencies = [
 [tool.setuptools]
 py-modules = [
   "config", "data", "evaluation", "gnn", "gnn_bundle", "graph",
-  "laya", "laya_adapter", "laya_retrain", "pipeline", "retraining",
+  "laya_interface", "laya_adapter", "laya_retrain", "pipeline", "retraining",
   "tactic_choose",
 ]

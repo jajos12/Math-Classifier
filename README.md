@@ -29,7 +29,7 @@ Math-Classifier/
 ├── graph.py           Lean parser, DAG, and PyG conversion
 ├── gnn.py             model download and public inference API
 ├── gnn_bundle.py      published GATv2 checkpoint backend
-├── laya.py            public Laya adapter exports
+├── laya_interface.py  public Laya adapter exports
 ├── laya_adapter.py    local Laya loading, translation, and reranking
 ├── evaluation.py      metrics and JSON reports
 ├── pipeline.py        benchmark and validation CLI
