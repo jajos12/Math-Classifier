@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from laya_adapter import (
+    DEFAULT_INSTRUCTIONS,
     choice_question,
     translate_lean_state,
     translate_tactic_step,
@@ -25,7 +26,7 @@ from laya_adapter import (
 from graph import normalize_tactic
 from tactic_choose import validate_tactic_names
 
-LAYA_RETRAIN_INSTRUCTIONS = "Which Lean 4 tactic family best matches this proof step?"
+LAYA_RETRAIN_INSTRUCTIONS = DEFAULT_INSTRUCTIONS
 
 
 @dataclass(frozen=True)
@@ -100,13 +101,21 @@ def build_training_record(
         candidate_column=candidate_column,
     )
     translated_state = translate_lean_state(raw_state)
+    raw_tactic = str(row.get(tactic_column, "")).strip()
+    arguments = raw_tactic[len(target):].strip() if raw_tactic.startswith(target) else ""
     return {
         "state": translated_state,
         "raw_state": raw_state,
         "questions": {"tactic": choice_question(option_list, instructions)["tactic"]},
         "expected": {
             "tactic": target,
-            "description": translate_tactic_step(target),
+            "application": raw_tactic,
+            "description": translate_tactic_step(target, arguments),
+        },
+        "metadata": {
+            "candidate_count": len(option_list),
+            "candidate_order": list(option_list),
+            "prompt_version": "lean-tactic-family-v2",
         },
         "tags": ["atp", "laya-retrain", split_name],
         "row_index": row.get("row_index"),
@@ -216,6 +225,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tactic-column", default="tactic")
     parser.add_argument("--candidate-column", default="candidates")
     parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--instructions",
+        default=LAYA_RETRAIN_INSTRUCTIONS,
+        help="override the Laya choice prompt",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="print the first generated record after writing it",
+    )
     parser.add_argument("--trainer", help="optional remote trainer as module:function")
     return parser
 
@@ -231,10 +250,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         tactic_column=args.tactic_column,
         candidate_column=args.candidate_column or None,
         split_name=args.split,
+        instructions=args.instructions,
     )
     trainer = load_callable(args.trainer) if args.trainer else None
     result = retrain_laya(config, trainer=trainer)
     print(f"prepared translated Laya records: {result}")
+    if args.preview:
+        records = prepare_training_records(load_rows(config.dataset_path), config=config)
+        print(json.dumps(records[0], ensure_ascii=False, indent=2))
     return 0
 
 

@@ -13,7 +13,14 @@ except ImportError:
 
 from tactic_choose import TACTIC_SET
 
-DEFAULT_GLOSS = "Lean 4 tactic"
+DEFAULT_GLOSS = "a Lean 4 tactic family; choose it only when its name matches the proof step"
+DEFAULT_INSTRUCTIONS = (
+    "Analyze the Lean proof state and determine which proof action is most useful next. "
+    "Use the current goal together with the local hypotheses: look for hypotheses that "
+    "can be applied, rewritten, simplified, destructured, or used in arithmetic. "
+    "Consider the candidate tactic descriptions as hints about the actions they perform, "
+    "then rank the available actions by how well they fit this particular state."
+)
 TACTIC_GLOSS: dict[str, str] = {
     ".": "move on to the next goal in the list",
     "apply": "apply a lemma or hypothesis to the goal",
@@ -30,6 +37,35 @@ TACTIC_GLOSS: dict[str, str] = {
     "simpa": "simplify and then close with exact",
     "ring": "commutative ring normalization",
     "refine": "refine the goal with a partial term",
+    "aesop": "automatically search using safe local hypotheses and standard rules",
+    "by_cases": "split the proof into cases on a proposition",
+    "by_contra": "prove the goal by assuming its negation",
+    "calc": "start or continue a chained equality or relation calculation",
+    "change": "replace the goal with a definitionally equal form",
+    "clear": "remove an unused hypothesis from the local context",
+    "decide": "close a decidable proposition by computation",
+    "dsimp": "perform definitional simplification",
+    "exact_mod_cast": "close the goal after transporting across numeric casts",
+    "exfalso": "change the goal to False and derive a contradiction",
+    "exists": "provide a witness for an existential goal",
+    "ext": "reduce an equality of structures or functions to extensional goals",
+    "field_simp": "clear field denominators and reduce to ring-like goals",
+    "funext": "prove function equality by proving equality for every input",
+    "have": "introduce an intermediate proposition or local fact",
+    "induction": "split the proof using an induction principle",
+    "intro": "introduce a quantified variable or implication hypothesis",
+    "norm_num": "normalize and prove concrete numerical arithmetic",
+    "omega": "solve Presburger arithmetic over natural or integer variables",
+    "positivity": "prove that an expression is positive or nonnegative",
+    "rcases": "destructure a hypothesis into its components",
+    "ring_nf": "normalize a commutative semiring or ring expression",
+    "simp_all": "simplify the goal and all local hypotheses",
+    "solve_by_elim": "close the goal by applying matching local hypotheses",
+    "split": "split a conjunction, structure, or equivalent goal",
+    "subst": "replace a variable using an equality hypothesis",
+    "tauto": "solve a propositional-logic goal",
+    "unfold": "unfold a named definition",
+    "use": "supply a witness or explicit term for the goal",
 }
 
 
@@ -71,20 +107,39 @@ def translate_tactic_step(tactic_name: str, arguments: str = "") -> str:
     tactic = tactic_name.strip()
     if tactic not in TACTIC_SET:
         raise ValueError(f"Unknown tactic family: {tactic_name!r}")
-    gloss = TACTIC_GLOSS.get(tactic, f"apply the Lean tactic {tactic}")
+    gloss = TACTIC_GLOSS.get(tactic)
+    if gloss is None:
+        readable = tactic.replace("_", " ").replace("!", " aggressively")
+        gloss = f"use the Lean tactic family '{readable}'"
     suffix = f" with arguments {arguments.strip()}" if arguments.strip() else ""
     return f"Use the Lean tactic '{tactic}' to {gloss}{suffix}."
 
 
 def translate_lean_state(text_state: str) -> str:
-    """Translate a proof state while keeping its goal before its context."""
+    """Render a proof state as a clear, structured description for Laya.
+
+    Lean identifiers and expressions remain visible so the model can use exact
+    names, while headings make the goal/context relationship explicit.
+    """
     parsed = parse_state(text_state)
-    context = "\n".join(
-        f"Hypothesis {hypothesis.name}: {translate_lean_statement(hypothesis.type_expr)}"
-        for hypothesis in parsed.hypotheses
-    )
     goal = translate_lean_statement(parsed.goal)
-    return f"GOAL: {goal}\nCONTEXT: {context}"
+    if parsed.hypotheses:
+        context_lines = [
+            f"- {hypothesis.name}: {translate_lean_statement(hypothesis.type_expr)}"
+            for hypothesis in parsed.hypotheses
+        ]
+        context = "\n".join(context_lines)
+    else:
+        context = "- No local hypotheses are available."
+    return (
+        "PROOF STATE\n"
+        "CURRENT GOAL\n"
+        f"{goal}\n"
+        "LOCAL HYPOTHESES\n"
+        f"{context}\n"
+        "TASK\n"
+        "Choose the proof action that best advances the current goal using this context."
+    )
 
 
 def laya_state(text_state: str) -> str:
@@ -92,7 +147,10 @@ def laya_state(text_state: str) -> str:
     return translate_lean_state(text_state)
 
 
-def choice_question(candidates: Sequence[str], instructions: str) -> dict[str, Any]:
+def choice_question(
+    candidates: Sequence[str],
+    instructions: str = DEFAULT_INSTRUCTIONS,
+) -> dict[str, Any]:
     """Build the documented Laya choice-question payload."""
     if not candidates:
         raise ValueError("choice questions need at least one candidate")
@@ -100,7 +158,10 @@ def choice_question(candidates: Sequence[str], instructions: str) -> dict[str, A
         "tactic": {
             "type": "choice",
             "instructions": instructions,
-            "criteria": {candidate: TACTIC_GLOSS.get(candidate, DEFAULT_GLOSS) for candidate in candidates},
+            "criteria": {
+                candidate: translate_tactic_step(candidate).removesuffix(".")
+                for candidate in candidates
+            },
         }
     }
 
@@ -131,7 +192,13 @@ class LayaAdapter:
         self.instructions = instructions
 
     @classmethod
-    def load(cls, model_name: str, *, device: str, instructions: str) -> "LayaAdapter":
+    def load(
+        cls,
+        model_name: str,
+        *,
+        device: str,
+        instructions: str = DEFAULT_INSTRUCTIONS,
+    ) -> "LayaAdapter":
         try:
             import laya
         except ImportError as exc:
