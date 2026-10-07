@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "math-classifier-laya-experiment"
+version = "0.1.0"
+description = "Standalone GNN and Laya tactic-ranking experiment"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "huggingface_hub",
+]
+
+[tool.setuptools.packages.find]
+include = ["laya_experiment*"]
