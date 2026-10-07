@@ -265,10 +265,17 @@ stop the run instead of producing incomplete benchmark numbers.
 
 ## Laya retraining
 
-The retraining command prepares Lean examples in the format consumed by a Laya
-trainer. It does not silently fine-tune a model: the project first translates
-and validates the data, then optionally calls a trainer supplied with
-`--trainer module:function`.
+There are two separate steps:
+
+```text
+Step A: prepare and inspect JSONL records  -> no GPU required
+Step B: fine-tune a Laya model            -> GPU/device depends on the trainer
+```
+
+`laya_retrain.py` implements Step A and provides the device choice for Step B.
+It translates and validates Lean examples in the format consumed by a Laya
+trainer. The repository still does not contain a native Laya fine-tuning loop,
+but `--device` is accepted by the CLI and passed to the trainer hook.
 
 ### 1. Download the training data
 
@@ -347,9 +354,32 @@ python3 laya_retrain.py \
     --preview
 ```
 
+You may also specify the intended trainer device in the same command. The
+value is validated immediately and passed to the trainer if `--trainer` is
+provided; it does not require Torch when no trainer is provided:
+
+```bash
+python3 laya_retrain.py \
+    data/train.parquet \
+    outputs/laya_train.jsonl \
+    --device cuda:1 \
+    --candidates rw,simp,exact,apply,assumption \
+    --preview
+```
+
 The command writes `outputs/laya_train.jsonl` and prints the first record.
 The preview is useful for checking that the dataset columns and state parser
 are correct before processing the complete dataset.
+
+This command can run on CPU and does not load Torch, CUDA, or the Laya model:
+
+```bash
+python3 laya_retrain.py \
+    data/train.parquet \
+    outputs/laya_train.jsonl \
+    --candidates rw,simp,simpa,exact,apply,assumption \
+    --preview
+```
 
 Each record contains:
 
@@ -387,12 +417,39 @@ python3 laya_retrain.py \
     data/train.parquet \
     outputs/laya_train.jsonl \
     --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
+    --device cuda:1 \
     --trainer my_trainer:train
 ```
 
-The callable receives `records=...` and `output_path=...`. Without
-`--trainer`, the command only creates and validates the training JSONL,
-which is the expected behavior.
+The callable receives `records=...`, `output_path=...`, and `device=...`. It is
+responsible for loading Laya and performing fine-tuning on that device:
+
+```python
+# my_trainer.py
+def train(records, output_path, device):
+    import laya
+
+    model = laya.load("convaiinnovations/laya", device=device)
+    # Call the training API supported by the installed Laya version here.
+    print(f"Fine-tuning on {device}")
+```
+
+Then run the wrapper with the Python environment that contains Torch, Laya,
+and the CUDA-compatible dependencies:
+
+```bash
+PYTHON=/home/jovyan/.venvs/notebook-py3.11/bin/python
+$PYTHON laya_retrain.py \
+    data/train.parquet \
+    outputs/laya_train.jsonl \
+    --candidates rw,simp,simpa,exact,apply,assumption \
+    --trainer my_trainer:train
+```
+
+Supported choices are `auto`, `cpu`, `cuda`, `cuda:0`, `cuda:1`, and other
+`cuda:N` values. With `auto`, the trainer receives `cuda` when Torch reports
+CUDA availability and `cpu` otherwise. Without `--trainer`, the command only
+creates and validates the training JSONL, which is the expected behavior.
 
 ### Prompt and candidate descriptions
 

@@ -39,6 +39,15 @@ class RetrainConfig:
     candidate_column: str | None = "candidates"
     instructions: str = LAYA_RETRAIN_INSTRUCTIONS
     split_name: str = "train"
+    device: str = "auto"
+
+    def __post_init__(self) -> None:
+        if self.device not in {"auto", "cpu", "cuda"} and not (
+            self.device.startswith("cuda:") and self.device[5:].isdigit()
+        ):
+            raise ValueError(
+                f"invalid device {self.device!r}; use auto, cpu, cuda, or cuda:N"
+            )
 
 
 def _parse_candidates(value: Any) -> list[str] | None:
@@ -215,7 +224,18 @@ def retrain_laya(
     if trainer is None:
         return output_path
     kwargs = dict(trainer_kwargs or {})
+    kwargs.setdefault("device", _resolve_device(config.device))
     return trainer(records=records, output_path=str(output_path), **kwargs)
+
+
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -227,6 +247,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tactic-column", default="tactic")
     parser.add_argument("--candidate-column", default="candidates")
     parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        metavar="DEVICE",
+        help="trainer device: auto, cpu, cuda, cuda:0, cuda:1, ... (default: auto)",
+    )
     parser.add_argument(
         "--instructions",
         default=LAYA_RETRAIN_INSTRUCTIONS,
@@ -253,10 +279,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         candidate_column=args.candidate_column or None,
         split_name=args.split,
         instructions=args.instructions,
+        device=args.device,
     )
     trainer = load_callable(args.trainer) if args.trainer else None
     result = retrain_laya(config, trainer=trainer)
     print(f"prepared translated Laya records: {result}")
+    if trainer is not None:
+        print(f"trainer device: {_resolve_device(config.device)}")
     if args.preview:
         records = prepare_training_records(load_rows(config.dataset_path), config=config)
         print(json.dumps(records[0], ensure_ascii=False, indent=2))
