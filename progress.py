@@ -187,7 +187,25 @@ class LineFilter:
             return
         match = EPOCH_MEAN_RE.match(line)
         if match and self._bar is not None:
+            # The epoch is over even if the final steps never hit Laya's
+            # 100-step print cadence; complete the segment so the bar does
+            # not freeze at the last logged step (e.g. "stuck at 87%").
+            epoch = int(match.group(1))
+            epochs = int(match.group(2))
+            if self._total:
+                segment = self._total // max(1, epochs)
+                self._bar.n = min(epoch * segment, self._total)
+            self._bar.set_postfix(epoch=f"{epoch}/{epochs}")
             self._emit_through_bar(line)
+            if epoch >= epochs:
+                # Training is done; what follows (evaluation, checkpoint
+                # writing) is a new silent stage — drop the bar so later
+                # output and the heartbeat are not pinned to a finished bar.
+                try:
+                    self._bar.close()
+                except Exception:
+                    pass
+                self._bar = None
             return
         self._emit_through_bar(line)
 
