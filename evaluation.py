@@ -101,18 +101,50 @@ def write_report(report: dict[str, Any], path: Path) -> Path:
     return path
 
 
+def recall_keys(metrics: dict[str, Any]) -> list[str]:
+    """Recall keys actually present, pool-size first, then @5 and @1.
+
+    ``build_report`` derives its keys from ``pool_k``/``select_k``, so a custom
+    configuration may never produce ``recall@5`` — plotting it blindly would
+    draw an empty bar that looks like a real score of zero.
+    """
+    present = [key for key in metrics if key.startswith("recall@")]
+    if not present:
+        return []
+    ordered = [present[0]]
+    for key in ("recall@5", "recall@1"):
+        if key in metrics and key not in ordered:
+            ordered.append(key)
+    ordered.extend(key for key in present if key not in ordered)
+    return ordered
+
+
 def write_metrics_image(report: dict[str, Any], path: Path) -> Path:
     """Write a readable visual comparison of the benchmark metrics."""
     import matplotlib.pyplot as plt
 
     systems = ("gnn", "laya")
     labels = ("GNN", "Laya")
-    metric_keys = (
-        next(key for key in report["metrics"]["gnn"] if key.startswith("recall@")),
-        "recall@5",
-        "recall@1",
-    )
+    metric_keys = recall_keys(report["metrics"]["gnn"])
     colors = ("#4472C4", "#ED7D31")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not metric_keys:
+        figure, axes = plt.subplots(figsize=(8, 4))
+        axes.axis("off")
+        axes.text(
+            0.5,
+            0.5,
+            "No recall metrics to plot:\n"
+            f"every target was unknown on {report.get('rows', 0)} rows.",
+            ha="center",
+            va="center",
+            fontsize=13,
+        )
+        figure.suptitle("GNN versus Laya tactic-ranking evaluation", fontsize=16)
+        figure.tight_layout()
+        figure.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(figure)
+        return path
     figure, axes = plt.subplots(2, 2, figsize=(12, 8))
 
     values = [

@@ -32,8 +32,12 @@ Math-Classifier/
 ├── laya_interface.py  public Laya adapter exports
 ├── laya_adapter.py    local Laya loading, translation, and reranking
 ├── evaluation.py      metrics and JSON reports
+├── comparison.py      pool cache, multi-checkpoint comparison, run history
+├── progress.py        progress bars, heartbeats, and stage banners
 ├── pipeline.py        benchmark and validation CLI
-├── laya_retrain.py    translated training-record preparation
+├── laya_retrain.py    translated training-record preparation and CLI
+├── laya_trainer.py    built-in laya.train.finetune adapter
+├── tactic_choose.py   tactic candidate catalog and name validation
 └── retraining.py      public retraining exports
 ```
 
@@ -250,6 +254,22 @@ reranks the same top-10 candidates with Laya, and writes:
 outputs/metrics.json
 outputs/predictions.json
 outputs/metrics.png
+outputs/history.jsonl
+outputs/environment.json
+```
+
+`metrics.json` and `predictions.json` describe this run. `history.jsonl` gets
+one appended line per run (metrics, model, device, package versions) so runs
+can be compared later without keeping every `metrics.json` around.
+`environment.json` records the interpreter, package versions, CUDA visibility,
+and the git commit of the run that produced it.
+
+Use `--laya-model <path>` to rerank the pool with a fine-tuned checkpoint
+instead of the published one:
+
+```bash
+python pipeline.py benchmark --rows 100 --device cuda:1 \
+    --laya-model outputs/laya-checkpoint
 ```
 
 The command also prints a performance summary at the end. Open
@@ -272,10 +292,16 @@ Step A: prepare and inspect JSONL records  -> no GPU required
 Step B: fine-tune a Laya model            -> GPU/device depends on the trainer
 ```
 
-`laya_retrain.py` implements Step A and provides the device choice for Step B.
-It translates and validates Lean examples in the format consumed by a Laya
-trainer. The repository still does not contain a native Laya fine-tuning loop,
-but `--device` is accepted by the CLI and passed to the trainer hook.
+`laya_retrain.py` implements both. Step A streams the dataset into
+`outputs/laya_train.jsonl` (no GPU, bounded memory) and prints a per-reason
+report of every row it could not use. Step B is `--fine-tune`, which calls
+Laya's public `laya.train.finetune` through `laya_trainer.py` and then, unless
+disabled, reranks a cached GNN pool with both the base and the new checkpoint
+so the two can be compared directly.
+
+The CLI prints stage banners (`pre-flight`, `stage 1/3 translating records`,
+`stage 2/3 fine-tuning Laya`, `stage 3/3 comparing checkpoints`) with elapsed
+times, so a long run always shows where it is.
 
 ### 1. Download the training data
 
@@ -358,6 +384,50 @@ python3 laya_retrain.py \
 The command writes `outputs/laya_train.jsonl` and prints the first record.
 Inspect the preview before processing the complete dataset.
 
+Preparation reads parquet in chunks and writes JSONL row by row, so a
+218k-row dataset is never held in memory twice. A `translate` progress bar
+shows the row count and rate. Rows that cannot be translated are skipped and
+counted instead of aborting the run:
+
+| reason | meaning |
+| --- | --- |
+| `state_missing` / `state_empty` | `text_state` is null, `NaN`, or blank |
+| `state_invalid` | the state could not be parsed into a proof state |
+| `tactic_missing` / `tactic_empty` | `tactic` is null or has no usable tactic name |
+| `tactic_unknown` | the tactic family is not in `tactic_choose.py` |
+| `candidates_invalid` | the `candidates` column is not a list or JSON/comma string |
+| `candidates_missing` | no `candidates` column and no `--candidates` list |
+
+Pass `--strict` to stop at the first such row instead (row numbers are
+1-based). The summary and the sidecar report every count:
+
+```text
+outputs/laya_train.stats.json
+```
+
+That file records rows read, records written, skipped rows by reason with one
+example each, how many rows had the gold tactic inserted into the candidate
+list, and the histogram of candidate counts per row (normally 16 or 17). It is
+read again after training and copied into `outputs/comparison.json`.
+
+Useful flags for the first run:
+
+```bash
+# translate only the first 5000 rows (fast smoke run)
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --candidates rw,simp,...,aesop --limit 5000
+
+# or a reproducible random sample of 5000 rows
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --candidates rw,simp,...,aesop --sample 5000 --seed 42
+```
+
+`--quiet` hides the bar, `--preview` prints the first record after it is
+written, and `--dry-run` prepares the records and then asks
+`laya.train.dry_run` how many of them become trainable items — without loading
+model weights or touching the GPU. `--dry-run` is the cheapest way to find out
+that a prompt or candidate list is wrong before committing to a training run.
+
 Each record contains:
 
 - `raw_state`: the original Lean proof state.
@@ -375,8 +445,29 @@ and a clearer description of how the goal relates to the local hypotheses.
 
 ### 4. Prepare validation data
 
+`--fine-tune --eval-data <path>` fails immediately if that file is missing, and
+Laya only reports it *after* it has read and encoded the whole training set.
+Prepare the validation JSONL first — it is cheap to check and expensive to
+discover late.
+
 Use a separate validation parquet file. Do not use the final assessment/test
-file to choose training settings or a checkpoint:
+file to choose training settings or a checkpoint. If you have no separate
+validation split, carve one out of `data/train.parquet` before fine-tuning:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import pandas as pd
+
+frame = pd.read_parquet("data/train.parquet")
+validation = frame.sample(n=5000, random_state=42)
+frame.drop(validation.index).to_parquet("data/train_fit.parquet", index=False)
+validation.to_parquet("data/validation.parquet", index=False)
+print(f"fit: {len(frame) - len(validation)} rows, validation: {len(validation)} rows")
+PY
+```
+
+Then translate both files with the same candidate list:
 
 ```bash
 python3 laya_retrain.py \
@@ -385,6 +476,11 @@ python3 laya_retrain.py \
     --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
     --device cpu
 ```
+
+Do not train on rows you also pass to `--eval-data`: the numbers then measure
+memorization. `outputs/laya_validation.jsonl` is only the Laya eval file — the
+benchmark test split used by the post-training comparison is a different,
+untouched split.
 
 ### 5. Run fine-tuning on the GPU server
 
@@ -397,7 +493,29 @@ calibration temperatures, and writes a checkpoint that can be loaded with
 python3 -m pip install --upgrade --no-deps 'laya>=0.3.28,<0.5'
 ```
 
-Run this after the training preview and validation preparation succeed:
+Run this after the training preview and validation preparation succeed. The
+first run should be small:
+
+```bash
+python3 laya_retrain.py \
+    data/train.parquet \
+    outputs/laya_train.jsonl \
+    --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
+    --device cuda:1 \
+    --limit 5000 \
+    --fine-tune \
+    --model-dir convaiinnovations/laya \
+    --checkpoint-dir outputs/laya-checkpoint-smoke \
+    --eval-data outputs/laya_validation.jsonl \
+    --epochs 1 \
+    --dry-run
+```
+
+`--dry-run` stops after preparing the records and asking
+`laya.train.dry_run` how many become trainable items: rows, valid items,
+skipped rows, and the optimizer-step budget, with no model weights loaded.
+Drop `--dry-run`, raise `--limit` (or remove it for the full dataset), and set
+`--epochs 4` for the real run:
 
 ```bash
 python3 laya_retrain.py \
@@ -415,9 +533,27 @@ python3 laya_retrain.py \
     --loss rlcd
 ```
 
-`--fine-tune` writes the prepared records to
-`outputs/laya_train.finetune.jsonl`, then calls Laya's supported trainer. The
-checkpoint directory contains the model files, tokenizer, calibration
+Before training starts the command validates the inputs and prints what it is
+about to do: dataset row count and expected JSONL size, `--eval-data`
+existence and schema, and whether the requested `cuda:N` is actually visible.
+A missing validation file or an out-of-range GPU index fails here, in seconds,
+instead of after an hour of preprocessing.
+
+`--fine-tune` prepares `outputs/laya_train.jsonl` and passes that file
+directly to `laya.train.finetune` (there is no second copy). During training:
+
+- Laya prints nothing while it reads and encodes the JSONL. A heartbeat line
+  appears on stderr if that stage is quiet for 60 seconds, so a slow disk or a
+  large file never looks like a hang.
+- Once training starts, Laya's `epoch 1/4 step 100 loss 1.234` lines drive a
+  progress bar with epoch, step, and loss. `--log-every N` changes how often
+  Laya prints them (`--log-every 0` disables them), and `--no-progress` shows
+  the raw lines instead of the bar.
+- Every stage banner carries an elapsed time, and the final report records the
+  device actually used and the wall-clock training time in
+  `training_report.json`.
+
+The checkpoint directory contains the model files, tokenizer, calibration
 configuration, questions, and `training_report.json`. Checkpoint loading can
 be verified without running evaluation:
 
@@ -426,13 +562,83 @@ python3 - <<'PY'
 import laya
 laya.load("outputs/laya-checkpoint", device="cuda:1")
 print("fine-tuned checkpoint loads successfully")
+PY
 ```
 
 Supported devices are `auto`, `cpu`, `cuda`, `cuda:0`, `cuda:1`, and other
 `cuda:N` values. The retraining default is `cuda:0`; pass `--device` to select
 another GPU or CPU. With `auto`, the trainer selects CUDA when Torch reports
-CUDA availability. The old `--trainer module:function` hook remains available
-for custom Laya integrations.
+CUDA availability. When a `cuda:N` is requested and `CUDA_VISIBLE_DEVICES` is
+not already set, the trainer restricts visibility to that GPU so it becomes
+`cuda:0` for Laya; the automatic comparison afterwards re-derives the correct
+device automatically. If `CUDA_VISIBLE_DEVICES` is already set, the index is
+left alone — it is interpreted relative to that selection, which is what
+`pipeline.py devices` prints.
+
+The old `--trainer module:function` hook remains available for custom Laya
+integrations. It receives `records=` (a lazy view of the written JSONL) and
+`output_path=` plus `device=`.
+
+### Automatic comparison after fine-tuning
+
+Unless `--no-compare` is given, the run ends with stage 3/3: the GNN builds
+its top-10 pool over `--compare-rows` rows of the test split (cached under
+`cache/`, so the GNN runs once and is reused by later runs), and both the base
+checkpoint and the new checkpoint rerank that identical pool. The result is a
+three-way table — GNN, base Laya, fine-tuned Laya — on the same rows (format
+shown, numbers from an example run):
+
+```text
+====================================================================
+POST-TRAINING COMPARISON (same GNN top-10 pool, same rows)
+====================================================================
+system           recall@10  recall@5   recall@1    mrr@10
+GNN                   0.900     0.750     0.250     0.420
+base                  0.350     0.250     0.050     0.140
+finetuned             0.520     0.410     0.130     0.240
+====================================================================
+```
+
+and writes:
+
+```text
+outputs/comparison.json   full metrics per checkpoint, option counts, environment
+outputs/comparison.png    recall chart plus confidence/fallback notes
+outputs/history.jsonl     one appended line for this run
+```
+
+Use `--compare-rows 0` or `--no-compare` to skip it, and `--compare-seed` /
+`--compare-split` to change the rows it uses. The comparison deliberately uses
+the benchmark's untouched test split, not the training or validation data.
+
+The first `benchmark` command also appends to `outputs/history.jsonl` and
+refreshes `outputs/environment.json`, so benchmark and fine-tune results are
+recorded in the same place.
+
+### Known measurement caveats
+
+- **Option-count mismatch.** Training records use the fixed candidate catalog
+  (16 items, plus the gold tactic when it was missing, so 17), while inference
+  reranks the GNN's top-10 pool. The model therefore sees a different number
+  of options at training and test time. This is recorded rather than papered
+  over: `outputs/laya_train.stats.json` holds `training_option_counts`, and
+  `outputs/comparison.json` holds `option_count.inference`,
+  `option_count.training_histogram`, and `option_count.mismatch`. Preparation
+  prints a note whenever the two disagree. `--shuffle-options` is on by
+  default so the model cannot learn a position prior over a fixed catalog
+  order; `--no-shuffle-options` turns it off.
+- **Calibration warning.** Loading Laya prints a
+  `RuntimeWarning: ... uncalibrated` line about probability adjustment. It
+  means `answer_confidence` is not trustworthy on that checkpoint yet, which
+  is exactly what `--laya-confidence-threshold` keys off. The warnings
+  captured while loading each checkpoint are stored under `load_warnings` in
+  `outputs/comparison.json` and `models.<name>.warning` in `history.jsonl`.
+  Until a checkpoint is recalibrated, prefer a threshold of `0` (disabled) and
+  read the recall numbers rather than the confidences.
+- **Laya on CPU.** If Laya cannot use the requested GPU it falls back to CPU
+  silently from its own perspective. The comparison detects this, warns, and
+  records `laya_device.requested` / `laya_device.actual` so a slow or
+  surprising run is attributable.
 
 ### 6. Record and export the run
 
@@ -454,12 +660,16 @@ for the separate assessment server:
 The important output files are:
 
 ```text
-outputs/laya_train.jsonl
-outputs/laya_train.finetune.jsonl
-outputs/laya_validation.jsonl
-outputs/laya-checkpoint/
+outputs/laya_train.jsonl              prepared training records
+outputs/laya_train.stats.json         rows written, skipped, option counts
+outputs/laya_validation.jsonl         held-out records for --eval-data
+outputs/laya-checkpoint/              fine-tuned model
 outputs/laya-checkpoint/training_report.json
 outputs/laya-checkpoint/run_environment.txt
+outputs/comparison.json               base vs fine-tuned metrics
+outputs/comparison.png
+outputs/history.jsonl                 every benchmark/comparison run
+outputs/environment.json              interpreter, packages, CUDA, git state
 ```
 
 Copy this frozen checkpoint to the assessment server. Do not retrain or change
@@ -475,6 +685,97 @@ Descriptions explain operations such as rewriting, applying a hypothesis,
 simplifying, destructuring, introducing variables, or solving arithmetic.
 Use `--instructions "..."` if you need to test a different prompt.
 
+## Testing a run end-to-end
+
+Work through these in order. Each step is cheap enough to repeat and fails
+loudly before the next, more expensive one starts.
+
+**0. Environment (seconds, no downloads)**
+
+```bash
+python pipeline.py validate
+python -m compileall -q .
+python pipeline.py runtime
+python pipeline.py devices
+```
+
+`validate` proves the parser/graph path works without Torch, PyG, or Laya.
+
+Every retraining command below uses the same candidate list, so define it
+once:
+
+```bash
+export CANDS="rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop"
+```
+
+**1. Preparation smoke run (seconds)**
+
+```bash
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --candidates "$CANDS" --limit 5000 --preview
+```
+
+Check three things in the output: the `sample` line (how many of the first
+200 rows were usable), the skipped-row summary (each reason and count), and
+the printed record (`expected.tactic` should be the tactic you expect, and
+`metadata.candidate_order` should list the candidates).
+
+**2. Dry run over the whole dataset (minutes, no GPU)**
+
+Remove `--limit`, add `--dry-run`, and let it report the item counts and the
+optimizer budget:
+
+```bash
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --candidates "$CANDS" --dry-run
+```
+
+For 218,727 rows the JSONL is roughly 1.4 GB (about 7 KB per record), so the
+pre-flight prints the size before writing and warns that fine-tuning reads
+that file back into memory. Budget several GB of RAM for the training step
+and expect the first progress output only after Laya has read and encoded the
+file — that quiet window is what the heartbeat reports on.
+
+**3. Validation split (seconds)**
+
+Carve `data/validation.parquet` out of `data/train.parquet` as shown in step
+4, translate it to `outputs/laya_validation.jsonl`, and check the file exists
+and has content. Preparing this after training has started is the classic way
+to lose an hour.
+
+**4. Fine-tune smoke run (minutes on a GPU)**
+
+```bash
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --candidates "$CANDS" --device cuda:1 --limit 5000 \
+    --fine-tune --checkpoint-dir outputs/laya-checkpoint-smoke \
+    --eval-data outputs/laya_validation.jsonl --epochs 1
+```
+
+Confirm the stage banners appear, the heartbeat or progress bar starts, a
+checkpoint directory is written with `training_report.json`, and the final
+comparison table prints. Delete the smoke checkpoint afterwards.
+
+**5. Full run**
+
+Repeat step 4 without `--limit` and with `--epochs 4`, then re-run the
+benchmark against the new checkpoint:
+
+```bash
+python pipeline.py benchmark --rows 100 --device cuda:1 \
+    --laya-model outputs/laya-checkpoint
+```
+
+Compare it with the base-checkpoint benchmark already stored in
+`outputs/history.jsonl`. Two runs that differ by more than a few points on
+`--rows 100` are usually noise; the automatic comparison in
+`outputs/comparison.json` is the paired measurement to trust, because it
+holds the pool fixed.
+
+If anything fails, `python pipeline.py validate` plus the pre-flight output
+from `laya_retrain.py` localize most problems (columns, candidates, GPU
+visibility, missing eval file) without touching the GPU.
+
 ## Important implementation details
 
 - The published vocabulary matches graphs built from `text_state`, not the
@@ -483,6 +784,17 @@ Use `--instructions "..."` if you need to test a different prompt.
 - GNN top-k ties are deterministic because Torch returns a fixed index order
   and Laya ties are sorted by tactic name.
 - Laya probabilities must contain exactly the GNN candidate set.
+- Preparation skips unusable rows and reports them per reason; `--strict`
+  restores fail-fast. Both the counts and one example per reason are written
+  to `outputs/laya_train.stats.json`.
+- Training records use a fixed 16/17-option catalog while inference reranks
+  the GNN top-10 pool. The mismatch is measured and recorded
+  (`option_count` in `outputs/comparison.json`), never silently corrected.
+- Candidate order is shuffled during training by default so a fixed catalog
+  order cannot become a position prior; `--no-shuffle-options` disables it.
+- Every run appends to `outputs/history.jsonl` and writes
+  `outputs/environment.json`, so results remain attributable after outputs
+  are overwritten.
 - Ranking evaluation does not execute Lean tactics. Proof execution should be
   added as a separate experiment with timeouts and rollback.
 
@@ -495,3 +807,5 @@ python -m compileall -q .
 
 The validation command does not require Torch, PyG, Hugging Face access, or
 Laya. It checks that the local parser creates a valid proof-state graph.
+`compileall` catches syntax errors across every module, including the ones
+that only run on the GPU server.

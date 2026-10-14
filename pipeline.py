@@ -8,6 +8,12 @@ import os
 from pathlib import Path
 import sys
 
+from comparison import (
+    append_history,
+    describe_device,
+    rerank_states,
+    write_environment,
+)
 from config import ExperimentConfig
 from data import download_dataset, load_dataset, sample_dataset
 from evaluation import build_report, print_summary, write_metrics_image, write_report
@@ -45,6 +51,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("standard", "balanced"),
         default="standard",
         help="Laya scoring mode; balanced removes candidate-order bias but is slower",
+    )
+    benchmark.add_argument(
+        "--laya-model",
+        default="convaiinnovations/laya",
+        help="base Laya checkpoint or fine-tuned checkpoint directory to rerank with",
     )
     benchmark.add_argument(
         "--laya-confidence-threshold",
@@ -99,17 +110,23 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             laya_device=args.laya_device,
             laya_mode=args.laya_mode,
+            laya_model=args.laya_model,
             laya_confidence_threshold=args.laya_confidence_threshold,
             work_dir=args.work_dir,
         )
         config.prepare_directories()
+        from laya_trainer import validate_device
+
+        validate_device(config.resolved_device, label="--device")
+        validate_device(config.resolved_laya_device, label="--laya-device")
         paths = download_dataset(config.dataset_repo, config.split, config.dataset_dir)
         frame = sample_dataset(load_dataset(paths), config.n_rows, config.seed)
+        states = frame["text_state"].astype(str).tolist()
+        targets = [normalize_tactic(value) for value in frame["tactic"].tolist()]
         bundle_dir = download_bundle(config.model_repo, config.bundle_name, config.model_dir)
         bundle = load_bundle(bundle_dir)
         model, _ = build_model(bundle)
-        graphs = build_graphs(frame["text_state"].astype(str).tolist(), bundle,
-                              edge_mode=bundle.config["edge_mode"])
+        graphs = build_graphs(states, bundle, edge_mode=bundle.config["edge_mode"])
         gnn_rankings, gnn_scores = predict_top_k(
             model, graphs, bundle, config.pool_k,
             batch_size=config.batch_size, device=config.resolved_device,
@@ -118,30 +135,33 @@ def main(argv: list[str] | None = None) -> int:
             config.laya_model, device=config.resolved_laya_device,
             instructions=config.laya_instructions,
         )
-        laya_rankings = []
-        laya_confidences = []
-        laya_fallbacks = 0
-        for state, candidates in zip(frame["text_state"], gnn_rankings):
-            if config.laya_mode == "balanced":
-                result = adapter.balanced_predict(str(state), candidates)
-            else:
-                result = adapter.predict(str(state), candidates)
-            confidence = float(result.get("answer_confidence", 0.0))
-            if confidence < config.laya_confidence_threshold:
-                laya_rankings.append(list(candidates))
-                laya_fallbacks += 1
-            else:
-                laya_rankings.append(result["order"])
-            laya_confidences.append(confidence)
-        targets = frame["tactic"].map(normalize_tactic).tolist()
+        device_note = describe_device(adapter, config.resolved_laya_device)
+        outcome = rerank_states(
+            adapter,
+            states,
+            gnn_rankings,
+            mode=config.laya_mode,
+            threshold=config.laya_confidence_threshold,
+        )
+        laya_rankings = outcome["rankings"]
+        laya_confidences = outcome["confidences"]
+        laya_fallbacks = outcome["fallbacks"]
+        del adapter
         report = build_report(
             gnn_rankings, laya_rankings, targets,
             pool_k=config.pool_k, select_k=config.select_k,
         )
+        report["kind"] = "benchmark"
+        report["split"] = config.split
+        report["seed"] = config.seed
+        report["n"] = len(states)
         report["pool_k"] = config.pool_k
         report["laya_mode"] = config.laya_mode
+        report["laya_model"] = config.laya_model
         report["laya_confidence_threshold"] = config.laya_confidence_threshold
         report["laya_fallbacks"] = laya_fallbacks
+        report["laya_device"] = device_note
+        report["gnn_device"] = config.resolved_device
         output = write_report(report, config.resolved_output_dir / "metrics.json")
         image = write_metrics_image(report, config.resolved_output_dir / "metrics.png")
         (config.resolved_output_dir / "predictions.json").write_text(
@@ -157,8 +177,14 @@ def main(argv: list[str] | None = None) -> int:
             ),
             encoding="utf-8",
         )
+        history = append_history(report, config.resolved_output_dir)
+        environment = write_environment(config.resolved_output_dir)
         print(f"benchmark complete: {output}")
         print_summary(report, image)
+        if device_note["warning"]:
+            print(f"WARNING: {device_note['warning']}")
+        print(f"run history    : {history}")
+        print(f"environment    : {environment}")
     return 0
 
 

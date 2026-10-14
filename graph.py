@@ -68,8 +68,18 @@ TACTIC_TOKEN_RE = re.compile(r"[A-Za-z0-9_.'!?]+")
 
 
 def normalize_tactic(raw: str) -> str:
-    """Return the first tactic token from a tactic application."""
-    text = raw.strip()
+    """Return the first tactic token from a tactic application.
+
+    Missing labels (``None``, ``NaN``, pandas ``NA``) normalize to
+    ``<EMPTY_TACTIC>`` instead of raising, so a single unusable row cannot
+    abort an evaluation; ``build_report`` already excludes such rows from the
+    known-target mask.
+    """
+    if raw is None or type(raw).__name__ in {"NAType", "NaTType"}:
+        return "<EMPTY_TACTIC>"
+    if isinstance(raw, float) and raw != raw:  # NaN, including numpy float64
+        return "<EMPTY_TACTIC>"
+    text = str(raw).strip()
     if not text:
         return "<EMPTY_TACTIC>"
     match = TACTIC_TOKEN_RE.search(text)
