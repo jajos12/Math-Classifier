@@ -284,16 +284,47 @@ def build_training_record(
     }
 
 
+def _iter_parquet_rows(path: Path) -> Iterator[dict[str, Any]]:
+    """Stream parquet rows in batches.
+
+    ``pandas.read_parquet(chunksize=...)`` forwards ``chunksize`` to
+    ``pyarrow.parquet.read_table``, which older pyarrow releases reject, so the
+    batch API is used directly. ``ParquetFile.iter_batches`` has been available
+    since long before any version this project supports; a whole-file read is
+    the last resort when neither path is usable.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise RuntimeError("Install pandas and pyarrow to read parquet training data") from exc
+        yield from pd.read_parquet(path).to_dict("records")
+        return
+    try:
+        parquet = pq.ParquetFile(path)
+    except Exception:
+        import pandas as pd
+        yield from pd.read_parquet(path).to_dict("records")
+        return
+    for batch in parquet.iter_batches(batch_size=PARQUET_CHUNK_ROWS):
+        if hasattr(batch, "to_pylist"):
+            yield from batch.to_pylist()
+        else:
+            yield from batch.to_pandas().to_dict("records")
+
+
 def iter_rows(path: Path) -> Iterator[dict[str, Any]]:
     """Yield dataset rows one at a time, never materialising the whole file."""
     suffix = path.suffix.lower()
     if suffix == ".parquet":
         try:
-            import pandas as pd
-        except ImportError as exc:
-            raise RuntimeError("Install pandas and pyarrow to read parquet training data") from exc
-        for chunk in pd.read_parquet(path, chunksize=PARQUET_CHUNK_ROWS):
-            yield from chunk.to_dict("records")
+            yield from _iter_parquet_rows(path)
+        except Exception as exc:
+            # Surface any pyarrow/pandas failure as one actionable line; the
+            # handler in main() prints the chained cause underneath it.
+            raise RuntimeError(f"failed to read parquet dataset {path}") from exc
         return
     if suffix == ".csv":
         with path.open(newline="", encoding="utf-8") as handle:
@@ -829,6 +860,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         sys.stdout.flush()
         print(f"error: {exc}", file=sys.stderr)
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None and str(cause) != str(exc):
+            print(f"       caused by {type(cause).__name__}: {cause}", file=sys.stderr)
         return 1
 
 
