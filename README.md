@@ -34,7 +34,7 @@ Math-Classifier/
 ├── evaluation.py      metrics and JSON reports
 ├── comparison.py      pool cache, multi-checkpoint comparison, run history
 ├── progress.py        progress bars, heartbeats, and stage banners
-├── pipeline.py        benchmark and validation CLI
+├── pipeline.py        dataset split, benchmark and validation CLI
 ├── laya_retrain.py    translated training-record preparation and CLI
 ├── laya_trainer.py    built-in laya.train.finetune adapter
 ├── tactic_choose.py   tactic candidate catalog and name validation
@@ -446,28 +446,28 @@ and a clearer description of how the goal relates to the local hypotheses.
 ### 4. Prepare validation data
 
 `--fine-tune --eval-data <path>` fails immediately if that file is missing, and
-Laya only reports it *after* it has read and encoded the whole training set.
-Prepare the validation JSONL first — it is cheap to check and expensive to
-discover late.
+Laya only reports *overlap* with the training data after it has read and
+encoded the whole training set. Prepare the validation JSONL first — it is
+cheap to check and expensive to discover late.
 
 Use a separate validation parquet file. Do not use the final assessment/test
 file to choose training settings or a checkpoint. If you have no separate
 validation split, carve one out of `data/train.parquet` before fine-tuning:
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-import pandas as pd
-
-frame = pd.read_parquet("data/train.parquet")
-validation = frame.sample(n=5000, random_state=42)
-frame.drop(validation.index).to_parquet("data/train_fit.parquet", index=False)
-validation.to_parquet("data/validation.parquet", index=False)
-print(f"fit: {len(frame) - len(validation)} rows, validation: {len(validation)} rows")
-PY
+python3 pipeline.py split data/train.parquet
 ```
 
-Then translate both files with the same candidate list:
+This writes `data/train_fit.parquet` (80% of the rows) and
+`data/validation.parquet` (20%) from a seeded assignment: the two files share
+no rows, and the split is reproducible (`--validation-fraction` and `--seed`
+change it). Fine-tuning then trains on `data/train_fit.parquet`. The
+pre-flight of every fine-tune run intersects `--eval-data` with the training
+dataset — matched on `row_index`, falling back to the raw proof state — and
+refuses to start when they overlap, because an evaluation over its own
+training rows measures memorization. `--allow-eval-overlap` opts out.
+
+Translate the validation half with the same candidate list:
 
 ```bash
 python3 laya_retrain.py \
@@ -477,10 +477,9 @@ python3 laya_retrain.py \
     --device cpu
 ```
 
-Do not train on rows you also pass to `--eval-data`: the numbers then measure
-memorization. `outputs/laya_validation.jsonl` is only the Laya eval file — the
-benchmark test split used by the post-training comparison is a different,
-untouched split.
+`outputs/laya_validation.jsonl` is only the Laya eval file — the benchmark
+test split used by the post-training comparison is a different, untouched
+split.
 
 ### 5. Run fine-tuning on the GPU server
 
@@ -498,7 +497,7 @@ first run should be small:
 
 ```bash
 python3 laya_retrain.py \
-    data/train.parquet \
+    data/train_fit.parquet \
     outputs/laya_train.jsonl \
     --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
     --device cuda:1 \
@@ -519,7 +518,7 @@ Drop `--dry-run`, raise `--limit` (or remove it for the full dataset), and set
 
 ```bash
 python3 laya_retrain.py \
-    data/train.parquet \
+    data/train_fit.parquet \
     outputs/laya_train.jsonl \
     --candidates rw,simp,simpa,exact,apply,assumption,constructor,intro,cases,rcases,linarith,nlinarith,norm_num,ring,omega,aesop \
     --device cuda:1 \
@@ -535,9 +534,11 @@ python3 laya_retrain.py \
 
 Before training starts the command validates the inputs and prints what it is
 about to do: dataset row count and expected JSONL size, `--eval-data`
-existence and schema, and whether the requested `cuda:N` is actually visible.
-A missing validation file or an out-of-range GPU index fails here, in seconds,
-instead of after an hour of preprocessing.
+existence, schema, and whether its rows are disjoint from the training
+dataset, the optimizer budget (micro-batches per epoch, effective batch,
+total updates), and whether the requested `cuda:N` is actually visible. A
+missing validation file, an overlapping eval split, or an out-of-range GPU
+index fails here, in seconds, instead of after an hour of preprocessing.
 
 `--fine-tune` prepares `outputs/laya_train.jsonl` and passes that file
 directly to `laya.train.finetune` (there is no second copy). During training:
@@ -548,7 +549,13 @@ directly to `laya.train.finetune` (there is no second copy). During training:
 - Once training starts, Laya's `epoch 1/4 step 100 loss 1.234` lines drive a
   progress bar with epoch, step, and loss. `--log-every N` changes how often
   Laya prints them (`--log-every 0` disables them), and `--no-progress` shows
-  the raw lines instead of the bar.
+  the raw lines instead of the bar. Negative RLCD losses (`loss -0.5567`) are
+  normal and update the bar like any other value.
+- Budget the wall clock before you start: ~27,300 micro-batches per epoch at
+  `--micro-batch 8`, so ~109,000 for 4 epochs over 218k rows. A measured rate
+  of ~2.0–2.3 steps/s means roughly **13–15 hours**. The ETA shown during the
+  first ~100 steps reflects warmup and overestimates by about 4x — read the
+  rate again after step 500.
 - Every stage banner carries an elapsed time, and the final report records the
   device actually used and the wall-clock training time in
   `training_report.json`.
@@ -657,9 +664,11 @@ for the separate assessment server:
 } | tee outputs/laya-checkpoint/run_environment.txt
 ```
 
-The important output files are:
+The important files are:
 
 ```text
+data/train_fit.parquet                 training part of `pipeline.py split`
+data/validation.parquet                held-out part of the same split
 outputs/laya_train.jsonl              prepared training records
 outputs/laya_train.stats.json         rows written, skipped, option counts
 outputs/laya_validation.jsonl         held-out records for --eval-data
@@ -730,7 +739,7 @@ python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
     --candidates "$CANDS" --dry-run
 ```
 
-For 218,727 rows the JSONL is roughly 1.4 GB (about 7 KB per record), so the
+For 218,727 rows the JSONL is about 1 GB (roughly 4.5 KB per record), so the
 pre-flight prints the size before writing and warns that fine-tuning reads
 that file back into memory. Budget several GB of RAM for the training step
 and expect the first progress output only after Laya has read and encoded the
@@ -738,23 +747,31 @@ file — that quiet window is what the heartbeat reports on.
 
 **3. Validation split (seconds)**
 
-Carve `data/validation.parquet` out of `data/train.parquet` as shown in step
-4, translate it to `outputs/laya_validation.jsonl`, and check the file exists
-and has content. Preparing this after training has started is the classic way
-to lose an hour.
+```bash
+python3 pipeline.py split data/train.parquet
+python3 laya_retrain.py data/validation.parquet outputs/laya_validation.jsonl \
+    --candidates "$CANDS" --device cpu
+```
+
+Steps 4 and 5 must train on `data/train_fit.parquet`, never on the full
+`data/train.parquet`: the pre-flight rejects an `--eval-data` file whose rows
+are also in the training dataset, which is exactly the mistake this split
+prevents. Check that the translated validation file exists and has content —
+preparing it after training has started is the classic way to lose an hour.
 
 **4. Fine-tune smoke run (minutes on a GPU)**
 
 ```bash
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train_fit.parquet outputs/laya_train.jsonl \
     --candidates "$CANDS" --device cuda:1 --limit 5000 \
     --fine-tune --checkpoint-dir outputs/laya-checkpoint-smoke \
     --eval-data outputs/laya_validation.jsonl --epochs 1
 ```
 
-Confirm the stage banners appear, the heartbeat or progress bar starts, a
-checkpoint directory is written with `training_report.json`, and the final
-comparison table prints. Delete the smoke checkpoint afterwards.
+Confirm the pre-flight prints `eval overlap  : none`, the stage banners appear,
+the heartbeat or progress bar starts, a checkpoint directory is written with
+`training_report.json`, and the final comparison table prints. Delete the
+smoke checkpoint afterwards.
 
 **5. Full run**
 
@@ -787,6 +804,10 @@ visibility, missing eval file) without touching the GPU.
 - Preparation skips unusable rows and reports them per reason; `--strict`
   restores fail-fast. Both the counts and one example per reason are written
   to `outputs/laya_train.stats.json`.
+- Fine-tuning refuses an `--eval-data` file whose rows are also in the
+  training dataset (matched on `row_index`, falling back to the raw proof
+  state). `pipeline.py split` carves the disjoint pair, and
+  `--allow-eval-overlap` overrides the check when the overlap is intended.
 - Training records use a fixed 16/17-option catalog while inference reranks
   the GNN top-10 pool. The mismatch is measured and recorded
   (`option_count` in `outputs/comparison.json`), never silently corrected.

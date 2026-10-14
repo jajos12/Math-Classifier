@@ -101,8 +101,13 @@ class _NullBar:
         return None
 
 
-EPOCH_RE = re.compile(r"^epoch (\d+)/(\d+) step (\d+) loss ([0-9.]+)\s*$")
-EPOCH_MEAN_RE = re.compile(r"^epoch (\d+)/(\d+) mean loss ([0-9.]+)\s*$")
+# RLCD losses go negative (``loss -0.5567``), so the number pattern must accept
+# a sign and scientific notation, otherwise half of Laya's progress lines bypass
+# the bar and print raw. Wrapped in a group at each use to keep the original
+# group positions (loss is group 4 / group 3 respectively).
+LOSS_NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+EPOCH_RE = re.compile(rf"^epoch (\d+)/(\d+) step (\d+) loss ({LOSS_NUMBER})\s*$")
+EPOCH_MEAN_RE = re.compile(rf"^epoch (\d+)/(\d+) mean loss ({LOSS_NUMBER})\s*$")
 ITEMS_RE = re.compile(r"^train items (\d+), calibration items (\d+), eval items (\d+)")
 
 
@@ -205,10 +210,16 @@ class LineFilter:
             self._emit_raw(line + "\n")
             return
         try:
+            bar_file = getattr(self._bar, "fp", None) or sys.stderr
+            if bar_file is not self._stream:
+                # The bar's line ends with \r and no newline; terminate it so
+                # the forwarded text does not append to the progress bar.
+                print(file=bar_file)
             # ``file`` must be the captured stdout: tqdm.write() defaults to
             # sys.stdout, which is this filter itself inside redirect_stdout().
             self._bar.write(line, file=self._stream)
-        except TypeError:
+            self._bar.refresh()
+        except Exception:
             self._emit_raw(line + "\n")
 
     def _emit_raw(self, text: str) -> None:
@@ -261,13 +272,17 @@ class heartbeat:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
+            bar_obj = getattr(self._line_filter, "bar", None) if self._line_filter else None
+            # Once the training bar is up it is the progress indicator, and it
+            # only refreshes every --log-every steps, so stay quiet for longer:
+            # silence is expected between Laya's prints, a stall is not.
+            threshold = self.interval if bar_obj is None else self.interval * 5
             idle = time.monotonic() - self._last_activity
-            if idle < self.interval:
+            if idle < threshold:
                 continue
             elapsed = int(time.monotonic() - self._started)
             message = (f"  [{self.label}] still running — elapsed {format_elapsed(elapsed)}, "
                        f"no output for {max(1, int(idle))}s")
-            bar_obj = getattr(self._line_filter, "bar", None) if self._line_filter else None
             if bar_obj is not None:
                 try:
                     bar_obj.write(message, file=self.file)

@@ -15,7 +15,7 @@ from comparison import (
     write_environment,
 )
 from config import ExperimentConfig
-from data import download_dataset, load_dataset, sample_dataset
+from data import download_dataset, load_dataset, sample_dataset, split_dataset
 from evaluation import build_report, print_summary, write_metrics_image, write_report
 from graph import normalize_tactic, proof_state_to_dag
 from gnn import build_graphs, build_model, download_bundle, load_bundle, predict_top_k
@@ -65,10 +65,51 @@ def _parser() -> argparse.ArgumentParser:
         help="keep the GNN order when Laya top probability is below P (default: disabled)",
     )
     benchmark.add_argument("--work-dir", type=Path, default=Path.cwd())
+    split = subparsers.add_parser(
+        "split",
+        help="carve a disjoint validation split out of a dataset (default 80/20)",
+    )
+    split.add_argument("dataset", type=Path)
+    split.add_argument(
+        "--train-out",
+        type=Path,
+        metavar="PATH",
+        help="training part (default: <dataset dir>/<name>_fit<suffix>)",
+    )
+    split.add_argument(
+        "--validation-out",
+        type=Path,
+        metavar="PATH",
+        help="validation part (default: <dataset dir>/validation<suffix>)",
+    )
+    split.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.2,
+        metavar="F",
+        help="fraction of rows kept for validation (default: 0.2)",
+    )
+    split.add_argument(
+        "--seed", type=int, default=42, help="seed for the row assignment (default: 42)"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _dispatch(argv)
+    except (OSError, ValueError, RuntimeError) as exc:
+        # Expected failures (missing files, bad arguments) get one actionable
+        # line instead of a traceback; anything else still shows its traceback.
+        sys.stdout.flush()
+        print(f"error: {exc}", file=sys.stderr)
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None and str(cause) != str(exc):
+            print(f"       caused by {type(cause).__name__}: {cause}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "validate":
         dag = proof_state_to_dag("h : α = α\n⊢ α = α")
@@ -185,6 +226,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"WARNING: {device_note['warning']}")
         print(f"run history    : {history}")
         print(f"environment    : {environment}")
+    elif args.command == "split":
+        source = args.dataset
+        train_out = args.train_out or source.parent / f"{source.stem}_fit{source.suffix}"
+        validation_out = args.validation_out or source.parent / f"validation{source.suffix}"
+        train_rows, validation_rows = split_dataset(
+            source,
+            train_out,
+            validation_out,
+            validation_fraction=args.validation_fraction,
+            seed=args.seed,
+        )
+        total = train_rows + validation_rows
+        print(
+            f"split {source} — {total:,} rows, seed {args.seed}, "
+            f"validation fraction {args.validation_fraction:g}"
+        )
+        print(f"  train       : {train_out} — {train_rows:,} rows ({train_rows / total:.0%})")
+        print(
+            f"  validation  : {validation_out} — {validation_rows:,} rows "
+            f"({validation_rows / total:.0%})"
+        )
+        print(
+            "  the two files share no rows: train on the train file, and translate "
+            "the validation file for --eval-data"
+        )
     return 0
 
 

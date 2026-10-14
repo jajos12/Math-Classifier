@@ -586,7 +586,8 @@ def _check_eval_data(path: Path) -> None:
     if not path.is_file():
         raise FileNotFoundError(
             f"--eval-data {path} does not exist.\n"
-            "Prepare it first, for example:\n"
+            "Carve a disjoint validation split and translate it first:\n"
+            "  python3 pipeline.py split data/train.parquet\n"
             f"  python3 laya_retrain.py data/validation.parquet {path} "
             "--candidates <same list as the training run>"
         )
@@ -612,6 +613,140 @@ def _check_eval_data(path: Path) -> None:
             return
 
 
+def _load_eval_signatures(path: Path) -> tuple[int, list[str], list[int]]:
+    """Per-row keys of the eval file: (rows, row_index ids, hashes of raw_state)."""
+    ids: list[str] = []
+    states: list[int] = []
+    rows = 0
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            rows += 1
+            if not isinstance(record, dict):
+                continue
+            row_index = record.get("row_index")
+            if row_index is not None:
+                ids.append(str(row_index))
+            raw_state = record.get("raw_state")
+            if isinstance(raw_state, str) and raw_state.strip():
+                states.append(hash(raw_state))
+    return rows, ids, states
+
+
+def _dataset_columns(path: Path) -> set[str] | None:
+    """Column names of a parquet file (cheap); None when a row probe is needed."""
+    if path.suffix.lower() != ".parquet":
+        return None
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        return None
+    try:
+        parquet = pq.ParquetFile(path)
+        schema = getattr(parquet, "schema_arrow", None)
+        return set(schema.names if schema is not None else parquet.schema.names)
+    except Exception:
+        return None
+
+
+def _iter_column_values(path: Path, column: str) -> Iterator[Any]:
+    """Values of one column, projected out of parquet when pyarrow can do it."""
+    if path.suffix.lower() == ".parquet":
+        try:
+            import pyarrow.parquet as pq
+
+            parquet = pq.ParquetFile(path)
+            for batch in parquet.iter_batches(batch_size=8192, columns=[column]):
+                values = batch.column(0)
+                if hasattr(values, "to_pylist"):
+                    yield from values.to_pylist()
+                else:
+                    yield from values.to_pandas().tolist()
+            return
+        except Exception:
+            pass  # unknown column or old pyarrow: fall back to the generic stream
+    for row in iter_rows(path):
+        yield row.get(column)
+
+
+def _check_eval_overlap(
+    dataset_path: Path,
+    eval_path: Path,
+    *,
+    state_column: str = "text_state",
+    id_column: str = "row_index",
+) -> tuple[int, int, str] | None:
+    """Count eval rows that also occur in the training dataset.
+
+    Returns ``(shared, rows, matched on)`` — or ``None`` when the two files
+    share no usable key, in which case overlap cannot be determined cheaply.
+    Matching prefers ``row_index`` (cheap, exact) and falls back to the raw
+    proof state, which also catches duplicated rows under different indices.
+    """
+    rows, ids, states = _load_eval_signatures(eval_path)
+    if not rows:
+        return None
+    columns = _dataset_columns(dataset_path)
+    if columns is None:
+        first = next(iter_rows(dataset_path), None)
+        columns = set(first) if isinstance(first, Mapping) else set()
+    if len(ids) == rows and id_column in columns:
+        known = {str(value) for value in _iter_column_values(dataset_path, id_column)}
+        return sum(1 for value in ids if value in known), rows, id_column
+    # The dataset column holding the raw proof state: the parquet column for
+    # raw datasets, or the ``raw_state`` field when training from prepared records.
+    if len(states) == rows:
+        for column in (state_column, "raw_state"):
+            if column not in columns:
+                continue
+            known = {
+                hash(str(value)) for value in _iter_column_values(dataset_path, column)
+            }
+            return sum(1 for value in states if value in known), rows, column
+    return None
+
+
+def _report_eval_overlap(args: argparse.Namespace, config: RetrainConfig) -> None:
+    """Fail pre-flight when --eval-data rows are also rows of the training set."""
+    overlap = _check_eval_overlap(
+        config.dataset_path, args.eval_data, state_column=config.state_column
+    )
+    if overlap is None:
+        print(
+            "  eval overlap  : could not be checked (no shared row_index or "
+            f"{config.state_column}/raw_state key between the files)"
+        )
+        return
+    shared, rows, key = overlap
+    if not shared:
+        print(
+            f"  eval overlap  : none — {rows} eval rows are disjoint from "
+            f"{config.dataset_path.name} (matched on {key})"
+        )
+        return
+    if getattr(args, "allow_eval_overlap", False):
+        print(
+            f"  eval overlap  : WARNING {shared}/{rows} eval rows are also training "
+            "rows (allowed by --allow-eval-overlap; the eval measures memorization)"
+        )
+        return
+    suffix = config.dataset_path.suffix
+    train_file = config.dataset_path.parent / f"{config.dataset_path.stem}_fit{suffix}"
+    validation_file = config.dataset_path.parent / f"validation{suffix}"
+    raise ValueError(
+        f"--eval-data {args.eval_data} shares {shared}/{rows} rows with "
+        f"{config.dataset_path} (matched on {key}); evaluating on training rows "
+        "measures memorization, not generalization.\n"
+        "Carve a disjoint validation split out of the training data first:\n"
+        f"  python3 pipeline.py split {config.dataset_path}\n"
+        f"  python3 laya_retrain.py {validation_file} {args.eval_data} "
+        "--candidates <same list>\n"
+        f"then train on {train_file}, or pass --allow-eval-overlap to run anyway."
+    )
+
+
 def _sample_rows(path: Path, limit: int = SAMPLE_PREVIEW_ROWS) -> tuple[list[dict[str, Any]], int | None]:
     """Take a handful of rows for sizing, and the total row count when cheap."""
     import itertools
@@ -633,6 +768,7 @@ def preflight(
     if args.eval_data is not None:
         _check_eval_data(args.eval_data)
         print(f"  eval data     : {args.eval_data} ok")
+        _report_eval_overlap(args, config)
     if training:
         from laya_trainer import prepare_device
 
@@ -685,6 +821,16 @@ def preflight(
                 print(
                     "  note          : fine-tuning reads that file back into memory; "
                     "consider --limit for the first run"
+                )
+            if args.fine_tune:
+                micro_batch = max(1, args.micro_batch)
+                grad_accum = max(1, args.grad_accum)
+                per_epoch = -(-total // micro_batch)
+                updates = -(-per_epoch // grad_accum) * max(1, args.epochs)
+                print(
+                    f"  budget        : ~{per_epoch:,} micro-batches/epoch × {args.epochs} "
+                    f"= ~{per_epoch * args.epochs:,} steps, effective batch "
+                    f"{micro_batch * grad_accum} → ~{updates:,} optimizer updates"
                 )
         else:
             print(f"  dataset       : {config.dataset_path.name} (row count unknown)")
@@ -826,6 +972,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--eval-data", type=Path, help="optional held-out JSONL for Laya evaluation")
+    parser.add_argument(
+        "--allow-eval-overlap",
+        action="store_true",
+        help="start even when --eval-data rows are also in the training dataset "
+             "(the in-training evaluation then measures memorization)",
+    )
     parser.add_argument("--max-len", type=int)
     parser.add_argument("--head-max-len", type=int)
     compare = parser.add_mutually_exclusive_group()
