@@ -1,9 +1,15 @@
 """Prepare and launch text-only Laya retraining jobs.
 
 This module deliberately does not build PyG graphs. It translates Lean proof
-states into Laya-readable text before creating choice-training records. A
-remote server can supply its installed Laya training callable through
-``trainer=`` or the CLI's ``--trainer module:function`` option.
+states into Laya-readable text before creating choice-training records.
+
+Every record presents Laya with the same *shape* of decision it sees at
+inference: exactly ``POOL_SIZE`` (10) options built from the gold tactic plus
+9 unique distractors drawn at random from the most common tactic families in
+the corpus (``DISTRACTOR_TOP`` = 20). The gold tactic is placed at a random
+index in the option list, the draws are keyed per row, and training reshuffles
+the options every epoch (see :mod:`laya_trainer`), so neither the position nor
+the ordering of a candidate carries any signal about the answer.
 
 Preparation is streaming: parquet is read in chunks and JSONL is written row by
 row, so a 200k-row dataset never has to exist in memory twice. Rows that cannot
@@ -15,8 +21,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
+import hashlib
 import json
+import random
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -37,6 +44,10 @@ from tactic_choose import TACTIC_SET, validate_tactic_names
 LAYA_RETRAIN_INSTRUCTIONS = DEFAULT_INSTRUCTIONS
 PARQUET_CHUNK_ROWS = 2000
 SAMPLE_PREVIEW_ROWS = 200
+STATE_COLUMN = "text_state"
+TACTIC_COLUMN = "tactic"
+POOL_SIZE = 10  # options presented to Laya per record (gold + 9 distractors)
+DISTRACTOR_TOP = 20  # most common tactics the distractors are drawn from
 
 
 class InvalidRowError(ValueError):
@@ -51,16 +62,23 @@ class InvalidRowError(ValueError):
 class RetrainConfig:
     dataset_path: Path
     output_path: Path
-    candidates: tuple[str, ...] = ()
-    state_column: str = "text_state"
-    tactic_column: str = "tactic"
-    candidate_column: str | None = "candidates"
-    instructions: str = LAYA_RETRAIN_INSTRUCTIONS
-    split_name: str = "train"
+    distractor_pool: tuple[str, ...] = ()
+    distractor_pool_source: str = "dataset"
+    options_per_row: int = POOL_SIZE
+    seed: int = 42
     device: str = "cuda:0"
     strict: bool = False
 
     def __post_init__(self) -> None:
+        if self.options_per_row < 2:
+            raise ValueError("options_per_row must be at least 2")
+        if self.distractor_pool:
+            # Rejects anything outside the canonical catalog before any work starts.
+            object.__setattr__(
+                self,
+                "distractor_pool",
+                validate_tactic_names(list(self.distractor_pool)),
+            )
         if self.device not in {"auto", "cpu", "cuda"} and not (
             self.device.startswith("cuda:") and self.device[5:].isdigit()
         ):
@@ -73,6 +91,11 @@ class RetrainConfig:
         """Sidecar recording how many rows were usable and what they look like."""
         return self.output_path.parent / (self.output_path.stem + ".stats.json")
 
+    @property
+    def resolved_pool(self) -> tuple[str, ...]:
+        """The distractor pool; computed from the dataset when not supplied."""
+        return self.distractor_pool or compute_distractor_pool(self.dataset_path)
+
 
 @dataclass
 class PrepStats:
@@ -80,7 +103,7 @@ class PrepStats:
 
     rows_seen: int = 0
     written: int = 0
-    target_inserted: int = 0
+    gold_in_pool: int = 0
     candidate_counts: dict[int, int] = field(default_factory=dict)
     skipped: dict[str, int] = field(default_factory=dict)
     skip_examples: dict[str, str] = field(default_factory=dict)
@@ -94,12 +117,17 @@ class PrepStats:
     def accept(self, record: Mapping[str, Any]) -> None:
         self.written += 1
         metadata = record.get("metadata", {})
-        if metadata.get("target_inserted"):
-            self.target_inserted += 1
+        if metadata.get("gold_in_pool"):
+            self.gold_in_pool += 1
         count = int(metadata.get("candidate_count", 0))
         self.candidate_counts[count] = self.candidate_counts.get(count, 0) + 1
         if self.first_record is None:
             self.first_record = dict(record)
+
+    @property
+    def gold_inserted(self) -> int:
+        """Rows whose gold tactic was outside the common pool and added anyway."""
+        return self.written - self.gold_in_pool
 
     @property
     def total_skipped(self) -> int:
@@ -118,17 +146,18 @@ class PrepStats:
                 sorted(self.skipped.items(), key=lambda item: (-item[1], item[0]))
             )
             lines.append(f"  rows skipped   : {self.total_skipped} ({detail})")
-        if self.target_inserted:
-            lines.append(
-                f"  target inserted: {self.target_inserted} rows gained the gold tactic "
-                "as an extra candidate"
-            )
         if self.candidate_counts:
             counts = ", ".join(
                 f"{count} options x{rows}"
                 for count, rows in sorted(self.candidate_counts.items())
             )
             lines.append(f"  options per row: {counts}")
+        if self.written:
+            lines.append(
+                f"  gold in pool   : {self.gold_in_pool} rows had the gold tactic among "
+                f"the common tactics; {self.gold_inserted} rows had it inserted "
+                "from outside the pool"
+            )
         return lines
 
     def to_dict(self, config: "RetrainConfig") -> dict[str, Any]:
@@ -136,21 +165,25 @@ class PrepStats:
         return {
             "dataset": str(config.dataset_path),
             "output": str(config.output_path),
-            "split": config.split_name,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "rows_seen": self.rows_seen,
             "records_written": self.written,
             "rows_skipped": self.total_skipped,
             "skipped_by_reason": dict(sorted(self.skipped.items())),
             "skip_examples": dict(sorted(self.skip_examples.items())),
-            "target_inserted": self.target_inserted,
+            "gold_in_pool": self.gold_in_pool,
+            "gold_inserted": self.gold_inserted,
             "training_option_counts": counts,
-            "candidates_configured": list(config.candidates),
+            "distractor_pool": list(config.resolved_pool),
+            "distractor_pool_source": config.distractor_pool_source,
+            "options_per_row": config.options_per_row,
+            "candidate_seed": config.seed,
             "elapsed_seconds": round(self.elapsed, 2),
             "note": (
-                "Training records use the fixed candidate catalog above; the benchmark "
-                "reranks the GNN top-10. Compare training_option_counts with "
-                "inference_pool_k in outputs/comparison.json to see the mismatch."
+                "Each record presents the gold tactic plus unique distractors drawn "
+                "at random from the most common tactic families; the gold position "
+                "is randomized per row and the options are reshuffled every epoch, "
+                "so the order of the choices carries no signal."
             ),
         }
 
@@ -175,85 +208,129 @@ def _require_text(value: Any, column: str, reason: str) -> str:
     return text
 
 
-def _parse_candidates(value: Any) -> list[str] | None:
-    if _is_missing(value):
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return [item.strip() for item in text.split(",") if item.strip()]
-        value = parsed
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return [str(item) for item in value]
-    raise InvalidRowError(
-        "candidates_invalid",
-        "candidate options must be a list or a JSON/comma-separated string",
-    )
+class GoldRandomCandidates:
+    """Build the option pools Laya trains on: gold tactic + unique distractors.
+
+    Distractors are drawn uniformly at random, without replacement, from the
+    most common tactic families (``pool``), and the gold tactic is then placed
+    at a uniformly random index. Neither the set nor the order of the options
+    therefore leaks the answer, and every row sees the same 10-way decision
+    shape that inference presents (GNN top-10 reranking).
+
+    The draws are keyed on ``(seed, row)``, so they are identical across runs,
+    unaffected by ``--limit``/``--sample`` subsets, and reproducible when a
+    second file (validation) is translated with the same pool.
+    """
+
+    def __init__(
+        self,
+        pool: Sequence[str],
+        *,
+        options_per_row: int = POOL_SIZE,
+        seed: int = 42,
+    ) -> None:
+        pool = tuple(validate_tactic_names(list(pool)))
+        if len(pool) < 2:
+            raise ValueError(
+                f"the distractor pool needs at least 2 tactics, got {len(pool)}"
+            )
+        self.pool = pool
+        self.options_per_row = max(2, options_per_row)
+        self.seed = seed
+
+    @property
+    def distractor_count(self) -> int:
+        return min(self.options_per_row - 1, len(self.pool) - 1)
+
+    def for_row(
+        self, gold: str, *, row_key: str
+    ) -> tuple[list[str], bool]:
+        """Return (options, gold_was_in_pool) for one row's gold tactic."""
+        rng = random.Random(f"{self.seed}:{row_key}")
+        distractors = rng.sample(
+            [name for name in self.pool if name != gold], self.distractor_count
+        )
+        options = [gold, *distractors]
+        rng.shuffle(options)  # the gold tactic lands at a uniform random index
+        return options, gold in self.pool
 
 
-def _row_candidates(
+def _row_key(row: Mapping[str, Any], fallback_text: str) -> str:
+    """Stable per-row key for the candidate RNG.
+
+    ``row_index`` when the dataset provides one; a hash of the raw proof state
+    otherwise (the built-in ``hash()`` is salted per process and would make
+    the draws differ between runs).
+    """
+    value = row.get("row_index")
+    if value is not None:
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "<na>", "none"}:
+            return text
+    digest = hashlib.sha1(fallback_text.encode("utf-8")).hexdigest()
+    return "state:" + digest[:16]
+
+
+def compute_distractor_pool(
+    path: Path, *, column: str = TACTIC_COLUMN, top_k: int = DISTRACTOR_TOP
+) -> tuple[str, ...]:
+    """The ``top_k`` most common tactic families over the whole corpus.
+
+    One projected single-column pass (parquet reads only ``column`` when
+    pyarrow can project it). Values are normalized to tactic families, and
+    anything outside the canonical catalog is ignored, so the pool always
+    consists of real tactic names. Ties break alphabetically, which keeps the
+    pool identical across runs and machines.
+    """
+    counts: dict[str, int] = {}
+    for value in _iter_column_values(path, column):
+        if _is_missing(value):
+            continue
+        name = normalize_tactic(str(value))
+        if name in TACTIC_SET:
+            counts[name] = counts.get(name, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    pool = tuple(name for name, _ in ranked[:top_k])
+    if len(pool) < 2:
+        raise ValueError(
+            f"{path} contains fewer than 2 known tactic families in {column!r}; "
+            "cannot build candidate pools from it"
+        )
+    return pool
+
+
+def build_training_record(
     row: Mapping[str, Any],
     *,
-    target: str,
-    configured: Sequence[str],
-    candidate_column: str | None,
-) -> tuple[tuple[str, ...], bool]:
-    """Return the candidate pool and whether the gold tactic had to be inserted."""
-    candidates = _parse_candidates(row.get(candidate_column)) if candidate_column else None
-    selected = list(candidates or configured)
-    if not selected:
+    candidates: GoldRandomCandidates,
+    instructions: str = LAYA_RETRAIN_INSTRUCTIONS,
+) -> dict[str, Any]:
+    """Translate one dataset row into an official-style Laya choice record.
+
+    The row's tactic becomes the gold option inside a ``POOL_SIZE``-option
+    choice question built by ``candidates``; everything else about the record
+    (state translation, descriptions) is identical for gold and distractors,
+    so the only learnable signal is the proof state itself.
+
+    Raises :class:`InvalidRowError` (a ``ValueError``) when the row cannot be
+    translated; callers decide whether that skips the row or stops the run.
+    """
+    raw_state = _require_text(row.get(STATE_COLUMN), STATE_COLUMN, "state")
+    raw_tactic = _require_text(row.get(TACTIC_COLUMN), TACTIC_COLUMN, "tactic")
+    target = normalize_tactic(raw_tactic)
+    if not target or target.startswith("<"):
         raise InvalidRowError(
-            "candidates_missing",
-            "no candidate pool was supplied; add a candidates column or pass --candidates",
+            "tactic_empty",
+            f"dataset row has no usable tactic in {TACTIC_COLUMN!r}: {raw_tactic!r}",
         )
-    try:
-        selected = list(validate_tactic_names(selected))
-    except ValueError as exc:
-        raise InvalidRowError("candidates_invalid", str(exc)) from exc
     if target not in TACTIC_SET:
         raise InvalidRowError(
             "tactic_unknown",
             f"tactic family {target!r} is not in the canonical catalog "
             "(see tactic_choose.py)",
         )
-    if target in selected:
-        return tuple(selected), False
-    selected.insert(0, target)
-    return tuple(selected), True
-
-
-def build_training_record(
-    row: Mapping[str, Any],
-    *,
-    candidates: Sequence[str] = (),
-    state_column: str = "text_state",
-    tactic_column: str = "tactic",
-    candidate_column: str | None = "candidates",
-    instructions: str = LAYA_RETRAIN_INSTRUCTIONS,
-    split_name: str = "train",
-) -> dict[str, Any]:
-    """Translate one dataset row into an official-style Laya choice record.
-
-    Raises :class:`InvalidRowError` (a ``ValueError``) when the row cannot be
-    translated; callers decide whether that skips the row or stops the run.
-    """
-    raw_state = _require_text(row.get(state_column), state_column, "state")
-    raw_tactic = _require_text(row.get(tactic_column), tactic_column, "tactic")
-    target = normalize_tactic(raw_tactic)
-    if not target or target.startswith("<"):
-        raise InvalidRowError(
-            "tactic_empty",
-            f"dataset row has no usable tactic in {tactic_column!r}: {raw_tactic!r}",
-        )
-    option_list, inserted = _row_candidates(
-        row,
-        target=target,
-        configured=candidates,
-        candidate_column=candidate_column,
+    option_list, gold_in_pool = candidates.for_row(
+        target, row_key=_row_key(row, raw_state)
     )
     try:
         translated_state = translate_lean_state(raw_state)
@@ -275,11 +352,11 @@ def build_training_record(
         },
         "metadata": {
             "candidate_count": len(option_list),
-            "candidate_order": list(option_list),
-            "target_inserted": inserted,
-            "prompt_version": "lean-tactic-family-v2",
+            "candidate_order": option_list,
+            "gold_in_pool": gold_in_pool,
+            "prompt_version": "lean-tactic-family-v3",
         },
-        "tags": ["atp", "laya-retrain", split_name],
+        "tags": ["atp", "laya-retrain"],
         "row_index": row.get("row_index"),
     }
 
@@ -351,16 +428,20 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
     return list(iter_rows(path))
 
 
-def _build_record(row: Mapping[str, Any], config: RetrainConfig) -> dict[str, Any]:
-    return build_training_record(
-        row,
-        candidates=config.candidates,
-        state_column=config.state_column,
-        tactic_column=config.tactic_column,
-        candidate_column=config.candidate_column,
-        instructions=config.instructions,
-        split_name=config.split_name,
+def _sampler_for(config: RetrainConfig) -> GoldRandomCandidates:
+    """The candidate builder for this run: configured pool, or computed now."""
+    return GoldRandomCandidates(
+        config.resolved_pool,
+        options_per_row=config.options_per_row,
+        seed=config.seed,
     )
+
+
+def _build_record(
+    row: Mapping[str, Any],
+    sampler: GoldRandomCandidates,
+) -> dict[str, Any]:
+    return build_training_record(row, candidates=sampler)
 
 
 def iter_training_records(
@@ -370,16 +451,18 @@ def iter_training_records(
     stats: PrepStats | None = None,
     progress: bool = True,
     total: int | None = None,
+    sampler: GoldRandomCandidates | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Translate rows, skipping (and counting) the ones that cannot be used."""
     stats = stats if stats is not None else PrepStats()
+    sampler = sampler if sampler is not None else _sampler_for(config)
     progress_bar = bar(total=total, desc="translate", disable=not progress, file=sys.stderr)
     try:
         for row in rows:
             stats.rows_seen += 1
             progress_bar.update(1)
             try:
-                record = _build_record(row, config)
+                record = _build_record(row, sampler)
             except InvalidRowError as exc:
                 if config.strict:
                     raise ValueError(
@@ -469,17 +552,6 @@ def prepare_dataset(config: RetrainConfig, stats: PrepStats | None = None) -> Pa
     return retrain_laya(config, stats=stats, progress=True)
 
 
-def load_callable(spec: str) -> Callable[..., Any]:
-    """Load a remote-server trainer as ``module:function``."""
-    module_name, separator, function_name = spec.partition(":")
-    if not separator or not module_name or not function_name:
-        raise ValueError("trainer must have the form module:function")
-    trainer = getattr(importlib.import_module(module_name), function_name, None)
-    if not callable(trainer):
-        raise TypeError(f"trainer {spec!r} is not callable")
-    return trainer
-
-
 def retrain_laya(
     config: RetrainConfig,
     *,
@@ -489,6 +561,7 @@ def retrain_laya(
     rows: Iterable[Mapping[str, Any]] | None = None,
     total: int | None = None,
     progress: bool = True,
+    sampler: GoldRandomCandidates | None = None,
     on_prepared: Callable[[PrepStats, Path], None] | None = None,
 ) -> Any:
     """Translate the dataset to JSONL, then optionally hand it to a trainer.
@@ -506,7 +579,8 @@ def retrain_laya(
     started = time.monotonic()
     source = rows if rows is not None else iter_rows(config.dataset_path)
     records = iter_training_records(
-        source, config=config, stats=stats, progress=progress, total=total
+        source, config=config, stats=stats, progress=progress, total=total,
+        sampler=sampler,
     )
     output_path = write_training_jsonl(records, config.output_path)
     stats.elapsed = time.monotonic() - started
@@ -589,7 +663,7 @@ def _check_eval_data(path: Path) -> None:
             "Carve a disjoint validation split and translate it first:\n"
             "  python3 pipeline.py split data/train.parquet\n"
             f"  python3 laya_retrain.py data/validation.parquet {path} "
-            "--candidates <same list as the training run>"
+            "--distractor-pool data/train_fit.parquet"
         )
     if path.stat().st_size == 0:
         raise ValueError(f"--eval-data {path} is empty")
@@ -675,7 +749,6 @@ def _check_eval_overlap(
     dataset_path: Path,
     eval_path: Path,
     *,
-    state_column: str = "text_state",
     id_column: str = "row_index",
 ) -> tuple[int, int, str] | None:
     """Count eval rows that also occur in the training dataset.
@@ -698,7 +771,7 @@ def _check_eval_overlap(
     # The dataset column holding the raw proof state: the parquet column for
     # raw datasets, or the ``raw_state`` field when training from prepared records.
     if len(states) == rows:
-        for column in (state_column, "raw_state"):
+        for column in (STATE_COLUMN, "raw_state"):
             if column not in columns:
                 continue
             known = {
@@ -710,13 +783,11 @@ def _check_eval_overlap(
 
 def _report_eval_overlap(args: argparse.Namespace, config: RetrainConfig) -> None:
     """Fail pre-flight when --eval-data rows are also rows of the training set."""
-    overlap = _check_eval_overlap(
-        config.dataset_path, args.eval_data, state_column=config.state_column
-    )
+    overlap = _check_eval_overlap(config.dataset_path, args.eval_data)
     if overlap is None:
         print(
             "  eval overlap  : could not be checked (no shared row_index or "
-            f"{config.state_column}/raw_state key between the files)"
+            f"{STATE_COLUMN}/raw_state key between the files)"
         )
         return
     shared, rows, key = overlap
@@ -742,7 +813,7 @@ def _report_eval_overlap(args: argparse.Namespace, config: RetrainConfig) -> Non
         "Carve a disjoint validation split out of the training data first:\n"
         f"  python3 pipeline.py split {config.dataset_path}\n"
         f"  python3 laya_retrain.py {validation_file} {args.eval_data} "
-        "--candidates <same list>\n"
+        f"--distractor-pool {train_file}\n"
         f"then train on {train_file}, or pass --allow-eval-overlap to run anyway."
     )
 
@@ -765,6 +836,23 @@ def preflight(
     banner("pre-flight checks")
     if not config.dataset_path.is_file():
         raise FileNotFoundError(f"dataset not found: {config.dataset_path}")
+    sampler = _sampler_for(config)
+    shown = ", ".join(sampler.pool[:10]) + (" ..." if len(sampler.pool) > 10 else "")
+    print(
+        f"  distractor pool: {len(sampler.pool)} common tactics from "
+        f"{config.distractor_pool_source}"
+    )
+    print(f"                 : {shown}")
+    if len(sampler.pool) < config.options_per_row:
+        print(
+            f"  warning        : the pool holds only {len(sampler.pool)} tactics, so "
+            f"records get {sampler.distractor_count + 1} options instead of "
+            f"{config.options_per_row}"
+        )
+    print(
+        f"  options/record : gold + {sampler.distractor_count} unique distractors "
+        f"(seed {config.seed}, random gold position, reshuffled every epoch)"
+    )
     if args.eval_data is not None:
         _check_eval_data(args.eval_data)
         print(f"  eval data     : {args.eval_data} ok")
@@ -773,7 +861,7 @@ def preflight(
         from laya_trainer import prepare_device
 
         effective = prepare_device(args.device, label="--device")
-        note = f" (visible as {effective})" if effective != args.device else ""
+        note = f" (remapped to {effective})" if effective != args.device else ""
         print(f"  device        : {args.device} ok{note}")
     sample, total = _sample_rows(config.dataset_path)
     estimated_bytes: int | None = None
@@ -782,7 +870,7 @@ def preflight(
         unusable: dict[str, str] = {}
         for row in sample:
             try:
-                prepared.append(_build_record(row, config))
+                prepared.append(_build_record(row, sampler))
             except ValueError as exc:
                 reason = getattr(exc, "reason", "invalid")
                 unusable.setdefault(reason, str(exc))
@@ -790,7 +878,8 @@ def preflight(
             reasons = "; ".join(f"{key}: {value}" for key, value in unusable.items())
             raise ValueError(
                 f"none of the {len(sample)} sampled rows can be translated ({reasons}). "
-                "Check --state-column/--tactic-column and the candidate list."
+                "Check that the dataset has usable text_state/tactic columns and that "
+                "the tactic families exist in tactic_choose.py."
             )
         if unusable:
             print(
@@ -888,33 +977,37 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Translate Lean dataset rows for Laya retraining")
     parser.add_argument("dataset", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--candidates", help="comma-separated candidate tactic families")
-    parser.add_argument("--state-column", default="text_state")
-    parser.add_argument("--tactic-column", default="tactic")
-    parser.add_argument("--candidate-column", default="candidates")
-    parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--distractor-pool",
+        metavar="POOL",
+        help="tactics the distractors are drawn from: a comma-separated list, "
+             "or a dataset file whose most common tactics become the pool "
+             "(default: computed from the dataset being translated)",
+    )
     parser.add_argument(
         "--device",
         default="cuda:0",
         metavar="DEVICE",
         help="trainer device: auto, cpu, cuda, cuda:0, cuda:1, ... (default: cuda:0)",
     )
-    parser.add_argument(
-        "--instructions",
-        default=LAYA_RETRAIN_INSTRUCTIONS,
-        help="override the Laya choice prompt",
-    )
     size = parser.add_mutually_exclusive_group()
     size.add_argument("--limit", type=int, metavar="N", help="translate only the first N rows")
     size.add_argument("--sample", type=int, metavar="N", help="translate N randomly chosen rows")
-    parser.add_argument("--seed", type=int, default=42, help="sampling seed for --sample")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="seed for --sample and for the per-row distractor/gold-position draws",
+    )
     parser.add_argument(
         "--strict",
         action="store_true",
         help="stop at the first unusable row instead of skipping and counting it",
     )
     parser.add_argument(
-        "--quiet", action="store_true", help="hide the preparation progress bar"
+        "--quiet",
+        action="store_true",
+        help="hide the preparation progress bar",
     )
     parser.add_argument(
         "--preview",
@@ -927,7 +1020,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="prepare the records, then ask laya.train.dry_run how many become "
              "training items, without loading model weights or training",
     )
-    parser.add_argument("--trainer", help="optional remote trainer as module:function")
     parser.add_argument(
         "--fine-tune",
         action="store_true",
@@ -942,35 +1034,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--micro-batch", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--loss", choices=("rlcd", "soft-ce"), default="rlcd")
-    parser.add_argument("--seed-training", type=int, default=42)
-    parser.add_argument(
-        "--log-every",
-        type=int,
-        default=100,
-        metavar="N",
-        help="Laya prints training progress every N micro-steps (0 disables it)",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="show raw trainer output instead of a progress bar",
-    )
-    shuffle = parser.add_mutually_exclusive_group()
-    shuffle.add_argument(
-        "--shuffle-options",
-        dest="shuffle_options",
-        action="store_true",
-        default=True,
-        help="reshuffle candidate order every epoch (default, fights position priors)",
-    )
-    shuffle.add_argument(
-        "--no-shuffle-options",
-        dest="shuffle_options",
-        action="store_false",
-        help="keep the configured candidate order fixed for every epoch",
-    )
-    parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--eval-data", type=Path, help="optional held-out JSONL for Laya evaluation")
     parser.add_argument(
         "--allow-eval-overlap",
@@ -978,28 +1041,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="start even when --eval-data rows are also in the training dataset "
              "(the in-training evaluation then measures memorization)",
     )
-    parser.add_argument("--max-len", type=int)
-    parser.add_argument("--head-max-len", type=int)
-    compare = parser.add_mutually_exclusive_group()
-    compare.add_argument(
-        "--no-compare",
-        action="store_true",
-        help="skip the automatic post-training comparison against the base checkpoint",
-    )
-    compare.add_argument(
+    parser.add_argument(
         "--compare-rows",
         type=int,
         default=100,
         metavar="N",
         help="test rows used by the automatic comparison (0 disables it; default 100)",
-    )
-    parser.add_argument("--compare-seed", type=int, default=42)
-    parser.add_argument("--compare-split", default="test")
-    parser.add_argument(
-        "--work-dir",
-        type=Path,
-        default=Path.cwd(),
-        help="where the comparison downloads weights, data and writes outputs",
     )
     return parser
 
@@ -1018,31 +1065,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
+def _resolve_distractor_pool(
+    value: str | None, dataset_path: Path
+) -> tuple[tuple[str, ...], str]:
+    """Resolve --distractor-pool into (pool, source) before any long work.
+
+    A comma-separated list is used as-is (validated against the canonical
+    catalog); a dataset path gets its most common tactics ranked instead, so
+    translating a validation split with ``--distractor-pool <train file>``
+    guarantees both halves present Laya with the identical pool.
+    """
+    if value is None:
+        return compute_distractor_pool(dataset_path), str(dataset_path)
+    text = value.strip()
+    if "," in text:
+        names = [name.strip() for name in text.split(",") if name.strip()]
+        if not names:
+            raise ValueError("--distractor-pool needs tactic names or a dataset path")
+        return validate_tactic_names(names), "--distractor-pool"
+    source = Path(text)
+    if not source.is_file():
+        raise ValueError(
+            f"--distractor-pool {source} is neither an existing dataset file nor a "
+            "comma-separated tactic list"
+        )
+    return compute_distractor_pool(source), str(source)
+
+
 def _run(args: argparse.Namespace) -> int:
-    candidates = tuple(_parse_candidates(args.candidates) or ())
+    pool, pool_source = _resolve_distractor_pool(args.distractor_pool, args.dataset)
     config = RetrainConfig(
         dataset_path=args.dataset,
         output_path=args.output,
-        candidates=validate_tactic_names(list(candidates)),
-        state_column=args.state_column,
-        tactic_column=args.tactic_column,
-        candidate_column=args.candidate_column or None,
-        split_name=args.split,
-        instructions=args.instructions,
+        distractor_pool=pool,
+        distractor_pool_source=pool_source,
+        seed=args.seed,
         device=args.device,
         strict=args.strict,
     )
-    if args.fine_tune and args.trainer:
-        raise ValueError("use either --fine-tune or --trainer, not both")
-    if args.dry_run and args.trainer:
-        raise ValueError("use either --dry-run or --trainer, not both")
 
     stats = PrepStats()
-    training = bool(args.fine_tune or args.trainer)
-    total, _ = preflight(args, config, training=training)
+    total, _ = preflight(args, config, training=args.fine_tune)
 
     banner(
-        "stage 1/3 translating records" if training else "translating records"
+        "stage 1/3 translating records" if args.fine_tune else "translating records"
     )
     rows, expected = _selected_rows(
         iter_rows(config.dataset_path),
@@ -1063,19 +1129,14 @@ def _run(args: argparse.Namespace) -> int:
             "epochs": args.epochs,
             "micro_batch": args.micro_batch,
             "grad_accum": args.grad_accum,
-            "loss": args.loss,
-            "seed": args.seed_training,
-            "freeze_encoder": args.freeze_encoder,
-            "shuffle_options": args.shuffle_options,
+            "loss": "rlcd",
+            "seed": args.seed,
+            "freeze_encoder": False,
+            # Always reshuffle the options: no fixed order can become a prior.
+            "shuffle_options": True,
             "eval_data": str(args.eval_data) if args.eval_data else None,
-            "max_len": args.max_len,
-            "head_max_len": args.head_max_len,
-            "log_every": args.log_every,
-            "progress": not args.no_progress,
+            "progress": not args.quiet,
         }
-    elif args.trainer:
-        trainer = load_callable(args.trainer)
-        trainer_kwargs = None
 
     training_run = trainer is not None and not args.dry_run
 
@@ -1119,7 +1180,7 @@ def _run(args: argparse.Namespace) -> int:
 
     print(f"\nfine-tune result: {_describe_result(result)}")
 
-    if args.fine_tune and not args.no_compare and args.compare_rows > 0:
+    if args.fine_tune and args.compare_rows > 0:
         _run_auto_compare(args, config, stats)
     return 0
 
@@ -1133,12 +1194,13 @@ def _report_preparation(stats: PrepStats, config: RetrainConfig) -> None:
     for line in stats.summary_lines():
         print(line)
     counts = sorted(stats.candidate_counts)
-    if counts and set(counts) != {10}:
+    if counts and set(counts) != {config.options_per_row}:
         print(
             "  NOTE: these records use "
-            f"{', '.join(str(count) for count in counts)} candidates, but the "
-            "benchmark reranks the GNN top-10. The mismatch is recorded in "
-            f"{config.stats_path.name} and in outputs/comparison.json."
+            f"{', '.join(str(count) for count in counts)} options, not "
+            f"{config.options_per_row}: the distractor pool holds too few distinct "
+            "tactics for this dataset, and the benchmark reranks the GNN top-10. "
+            f"The mismatch is recorded in {config.stats_path.name}."
         )
 
 
@@ -1170,13 +1232,11 @@ def _run_dry_run(args: argparse.Namespace, config: RetrainConfig) -> dict[str, A
         epochs=args.epochs,
         micro_batch=args.micro_batch,
         grad_accum=args.grad_accum,
-        loss=args.loss,
-        seed=args.seed_training,
-        freeze_encoder=args.freeze_encoder,
-        shuffle_options=("choice",) if args.shuffle_options else (),
+        loss="rlcd",
+        seed=args.seed,
+        freeze_encoder=False,
+        shuffle_options=("choice",),
         eval_data=str(args.eval_data) if args.eval_data else None,
-        max_len=args.max_len,
-        head_max_len=args.head_max_len,
     )
     return dry_run(str(config.output_path), args.model_dir, config=train_config)
 
@@ -1210,15 +1270,14 @@ def _run_auto_compare(args: argparse.Namespace, config: RetrainConfig, stats: Pr
         print(f"  device: {args.device} → {device} (CUDA visibility was remapped for training)")
     experiment = ExperimentConfig(
         n_rows=args.compare_rows,
-        seed=args.compare_seed,
-        split=args.compare_split,
+        seed=42,
+        split="test",
         device=device,
         laya_device=device,
         laya_mode="standard",
-        work_dir=args.work_dir,
     )
-    print(f"  pool: {args.compare_rows} rows of the {args.compare_split!r} split "
-          f"(seed {args.compare_seed}), GNN top-{experiment.pool_k}")
+    print(f"  pool: {args.compare_rows} rows of the 'test' split "
+          f"(seed 42), GNN top-{experiment.pool_k}")
     print(f"  models: base {experiment.laya_model!r} vs fine-tuned {checkpoint!r}")
     report = compare_checkpoints(
         experiment,

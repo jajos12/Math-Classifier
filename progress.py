@@ -274,8 +274,9 @@ class heartbeat:
         while not self._stop.wait(self.interval):
             bar_obj = getattr(self._line_filter, "bar", None) if self._line_filter else None
             # Once the training bar is up it is the progress indicator, and it
-            # only refreshes every --log-every steps, so stay quiet for longer:
-            # silence is expected between Laya's prints, a stall is not.
+            # only refreshes every 100 steps (Laya's log cadence), so stay
+            # quiet for longer: silence is expected between Laya's prints, a
+            # stall is not.
             threshold = self.interval if bar_obj is None else self.interval * 5
             idle = time.monotonic() - self._last_activity
             if idle < threshold:

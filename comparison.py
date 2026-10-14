@@ -284,14 +284,15 @@ def _option_count_block(
         "training_histogram": histogram,
         "training_option_counts": training_counts,
         "mismatch": mismatch,
-        "target_inserted": (prep_stats or {}).get("target_inserted"),
+        "gold_in_pool": (prep_stats or {}).get("gold_in_pool"),
+        "gold_inserted": (prep_stats or {}).get("gold_inserted"),
         "rows_skipped": (prep_stats or {}).get("rows_skipped"),
         "skipped_by_reason": (prep_stats or {}).get("skipped_by_reason"),
         "training_output": (prep_stats or {}).get("output"),
         "note": (
-            "Training records were built from the fixed 16/17-option candidate "
-            "catalog while inference reranks the GNN top-10 pool; the two option "
-            "counts therefore differ. This is recorded, not corrected."
+            f"Training records presented {training_counts} options per row while "
+            f"inference reranks the GNN top-{config.pool_k} pool; the option counts "
+            "differ and are recorded, not corrected."
             if mismatch
             else None
         ),

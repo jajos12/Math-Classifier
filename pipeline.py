@@ -57,31 +57,11 @@ def _parser() -> argparse.ArgumentParser:
         default="convaiinnovations/laya",
         help="base Laya checkpoint or fine-tuned checkpoint directory to rerank with",
     )
-    benchmark.add_argument(
-        "--laya-confidence-threshold",
-        type=float,
-        default=0.0,
-        metavar="P",
-        help="keep the GNN order when Laya top probability is below P (default: disabled)",
-    )
-    benchmark.add_argument("--work-dir", type=Path, default=Path.cwd())
     split = subparsers.add_parser(
         "split",
         help="carve a disjoint validation split out of a dataset (default 80/20)",
     )
     split.add_argument("dataset", type=Path)
-    split.add_argument(
-        "--train-out",
-        type=Path,
-        metavar="PATH",
-        help="training part (default: <dataset dir>/<name>_fit<suffix>)",
-    )
-    split.add_argument(
-        "--validation-out",
-        type=Path,
-        metavar="PATH",
-        help="validation part (default: <dataset dir>/validation<suffix>)",
-    )
     split.add_argument(
         "--validation-fraction",
         type=float,
@@ -152,8 +132,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
             laya_device=args.laya_device,
             laya_mode=args.laya_mode,
             laya_model=args.laya_model,
-            laya_confidence_threshold=args.laya_confidence_threshold,
-            work_dir=args.work_dir,
         )
         config.prepare_directories()
         from laya_trainer import validate_device
@@ -228,8 +206,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
         print(f"environment    : {environment}")
     elif args.command == "split":
         source = args.dataset
-        train_out = args.train_out or source.parent / f"{source.stem}_fit{source.suffix}"
-        validation_out = args.validation_out or source.parent / f"validation{source.suffix}"
+        train_out = source.parent / f"{source.stem}_fit{source.suffix}"
+        validation_out = source.parent / f"validation{source.suffix}"
         train_rows, validation_rows = split_dataset(
             source,
             train_out,

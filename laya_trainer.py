@@ -40,7 +40,7 @@ def train(
     loss: str = "rlcd",
     seed: int = 42,
     freeze_encoder: bool = False,
-    shuffle_options: bool = False,
+    shuffle_options: bool = True,
     eval_data: str | None = None,
     max_len: int | None = None,
     head_max_len: int | None = None,
@@ -118,6 +118,11 @@ def train(
     print(f"  training file : {prepared_path} ({size_mb:.1f} MB)")
     print(f"  checkpoint    : {destination}")
     print(f"  device        : {effective_device} (requested {device})")
+    if shuffle_options:
+        print(
+            "  options       : candidate order is reshuffled every epoch, so no "
+            "fixed position prior can form"
+        )
     print(
         f"  progress      : Laya prints every {log_every} micro-steps; "
         "the bar below follows those lines"
