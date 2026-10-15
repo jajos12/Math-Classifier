@@ -5,11 +5,15 @@ states into Laya-readable text before creating choice-training records.
 
 Every record presents Laya with the same *shape* of decision it sees at
 inference: exactly ``POOL_SIZE`` (10) options built from the gold tactic plus
-9 unique distractors drawn at random from the most common tactic families in
-the corpus (``DISTRACTOR_TOP`` = 20). The gold tactic is placed at a random
-index in the option list, the draws are keyed per row, and training reshuffles
-the options every epoch (see :mod:`laya_trainer`), so neither the position nor
-the ordering of a candidate carries any signal about the answer.
+9 unique distractors. By default the distractors are drawn at random from the
+most common tactic families in the corpus (``DISTRACTOR_TOP`` = 20); when
+``--row-pools`` supplies the per-row GNN rankings written by
+``pipeline.py pools``, a row instead draws from *its own* GNN top-k — the same
+hard negatives inference presents — and only rows without a pool fall back to
+the random draw. The gold tactic is placed at a random index in the option
+list, the draws are keyed per row, and training reshuffles the options every
+epoch (see :mod:`laya_trainer`), so neither the position nor the ordering of a
+candidate carries any signal about the answer.
 
 Preparation is streaming: parquet is read in chunks and JSONL is written row by
 row, so a 200k-row dataset never has to exist in memory twice. Rows that cannot
@@ -37,6 +41,7 @@ from laya_adapter import (
     translate_lean_state,
     translate_tactic_step,
 )
+from data import pool_row_key
 from graph import normalize_tactic
 from progress import banner, bar, format_elapsed
 from tactic_choose import TACTIC_SET, validate_tactic_names
@@ -64,6 +69,8 @@ class RetrainConfig:
     output_path: Path
     distractor_pool: tuple[str, ...] = ()
     distractor_pool_source: str = "dataset"
+    row_pools: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    row_pools_source: str = ""
     options_per_row: int = POOL_SIZE
     seed: int = 42
     device: str = "cuda:0"
@@ -104,6 +111,8 @@ class PrepStats:
     rows_seen: int = 0
     written: int = 0
     gold_in_pool: int = 0
+    row_pool_matched: int = 0
+    row_pool_in_use: bool = False
     candidate_counts: dict[int, int] = field(default_factory=dict)
     skipped: dict[str, int] = field(default_factory=dict)
     skip_examples: dict[str, str] = field(default_factory=dict)
@@ -119,6 +128,10 @@ class PrepStats:
         metadata = record.get("metadata", {})
         if metadata.get("gold_in_pool"):
             self.gold_in_pool += 1
+        if "row_pool_matched" in metadata:
+            self.row_pool_in_use = True
+            if metadata.get("row_pool_matched"):
+                self.row_pool_matched += 1
         count = int(metadata.get("candidate_count", 0))
         self.candidate_counts[count] = self.candidate_counts.get(count, 0) + 1
         if self.first_record is None:
@@ -153,9 +166,19 @@ class PrepStats:
             )
             lines.append(f"  options per row: {counts}")
         if self.written:
+            if self.row_pool_in_use:
+                lines.append(
+                    f"  row pools     : {self.row_pool_matched:,} records drew "
+                    "distractors from their own row pool; "
+                    f"{self.written - self.row_pool_matched:,} fell back to the "
+                    "global pool"
+                )
+                gold_source = "its row's candidate pool"
+            else:
+                gold_source = "the common tactics"
             lines.append(
                 f"  gold in pool   : {self.gold_in_pool} rows had the gold tactic among "
-                f"the common tactics; {self.gold_inserted} rows had it inserted "
+                f"{gold_source}; {self.gold_inserted} rows had it inserted "
                 "from outside the pool"
             )
         return lines
@@ -176,6 +199,9 @@ class PrepStats:
             "training_option_counts": counts,
             "distractor_pool": list(config.resolved_pool),
             "distractor_pool_source": config.distractor_pool_source,
+            "row_pools_source": config.row_pools_source or None,
+            "row_pool_rows": len(config.row_pools),
+            "row_pool_matched": self.row_pool_matched,
             "options_per_row": config.options_per_row,
             "candidate_seed": config.seed,
             "elapsed_seconds": round(self.elapsed, 2),
@@ -211,15 +237,26 @@ def _require_text(value: Any, column: str, reason: str) -> str:
 class GoldRandomCandidates:
     """Build the option pools Laya trains on: gold tactic + unique distractors.
 
-    Distractors are drawn uniformly at random, without replacement, from the
-    most common tactic families (``pool``), and the gold tactic is then placed
-    at a uniformly random index. Neither the set nor the order of the options
-    therefore leaks the answer, and every row sees the same 10-way decision
-    shape that inference presents (GNN top-10 reranking).
+    Two distractor sources, applied per row:
+
+    * **Row pools** (``row_pools``): when the row's key is present, the
+      distractors are drawn from that row's own GNN ranking — the hard
+      negatives the benchmark actually reranks at inference. If the gold
+      tactic is already in the ranking it stays the only natural member; if it
+      is absent, it is inserted anyway and the row counts as ``gold_in_pool
+      = False``, mirroring how the benchmark treats rows whose gold is outside
+      the GNN top-k.
+    * **Global pool** (``pool``): the default, and the fallback for rows
+      without a matching row pool — distractors drawn uniformly at random,
+      without replacement, from the most common tactic families.
+
+    In both cases the gold tactic is placed at a uniformly random index, so
+    neither the set nor the order of the options leaks the answer and every
+    row sees the same 10-way decision shape that inference presents.
 
     The draws are keyed on ``(seed, row)``, so they are identical across runs,
     unaffected by ``--limit``/``--sample`` subsets, and reproducible when a
-    second file (validation) is translated with the same pool.
+    second file (validation) is translated with the same pool or row pools.
     """
 
     def __init__(
@@ -228,6 +265,7 @@ class GoldRandomCandidates:
         *,
         options_per_row: int = POOL_SIZE,
         seed: int = 42,
+        row_pools: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         pool = tuple(validate_tactic_names(list(pool)))
         if len(pool) < 2:
@@ -237,22 +275,49 @@ class GoldRandomCandidates:
         self.pool = pool
         self.options_per_row = max(2, options_per_row)
         self.seed = seed
+        # Keys are canonicalized once so a float-rendered row_index
+        # ("123.0") still matches the key built during translation ("123").
+        self.row_pools = (
+            {pool_row_key(key): tuple(names) for key, names in row_pools.items()}
+            if row_pools
+            else {}
+        )
 
     @property
     def distractor_count(self) -> int:
         return min(self.options_per_row - 1, len(self.pool) - 1)
+
+    def matched(self, row_key: str) -> bool:
+        """True when this row draws distractors from its own row pool."""
+        return pool_row_key(row_key) in self.row_pools
 
     def for_row(
         self, gold: str, *, row_key: str
     ) -> tuple[list[str], bool]:
         """Return (options, gold_was_in_pool) for one row's gold tactic."""
         rng = random.Random(f"{self.seed}:{row_key}")
-        distractors = rng.sample(
-            [name for name in self.pool if name != gold], self.distractor_count
-        )
+        ranking = self.row_pools.get(pool_row_key(row_key))
+        if ranking is None:
+            distractors = rng.sample(
+                [name for name in self.pool if name != gold], self.distractor_count
+            )
+        else:
+            hard = [name for name in ranking if name != gold]
+            needed = self.options_per_row - 1
+            if len(hard) >= needed:
+                distractors = rng.sample(hard, needed)
+            else:
+                # A ranking shorter than k (or one the gold dominates) is
+                # topped up from the global pool, never with duplicates.
+                distractors = list(hard)
+                taken = set(distractors) | {gold}
+                fill = [name for name in self.pool if name not in taken]
+                distractors.extend(
+                    rng.sample(fill, min(needed - len(distractors), len(fill)))
+                )
         options = [gold, *distractors]
         rng.shuffle(options)  # the gold tactic lands at a uniform random index
-        return options, gold in self.pool
+        return options, gold in (ranking if ranking is not None else self.pool)
 
 
 def _row_key(row: Mapping[str, Any], fallback_text: str) -> str:
@@ -299,6 +364,62 @@ def compute_distractor_pool(
     return pool
 
 
+def load_row_pools(path: Path) -> dict[str, tuple[str, ...]]:
+    """Per-row GNN candidate pools written by ``pipeline.py pools`` (JSONL).
+
+    Each line carries a dataset ``row_index`` and the GNN's top-k ranking for
+    that row. Rankings are normalized to canonical tactic families, unknown
+    names are dropped, and duplicates collapse in order, so each entry is a
+    ready-made hard-negative list. Keys are canonicalized with
+    :func:`data.pool_row_key`, and a bad line fails the run with its line
+    number instead of silently shrinking the pool.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(
+            f"--row-pools {path} is not a file; build it with "
+            f"`python3 pipeline.py pools --split train --out {path}`"
+        )
+    pools: dict[str, tuple[str, ...]] = {}
+    with path.open(encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{lineno}: not valid JSON ({exc})") from exc
+            if not isinstance(payload, Mapping):
+                raise ValueError(f"{path}:{lineno}: expected a JSON object")
+            key = pool_row_key(payload.get("row_index"))
+            if not key:
+                raise ValueError(f"{path}:{lineno}: every line needs a usable row_index")
+            ranking = payload.get("ranking")
+            if (
+                not isinstance(ranking, Sequence)
+                or isinstance(ranking, (str, bytes))
+                or not ranking
+            ):
+                raise ValueError(
+                    f"{path}:{lineno}: ranking must be a non-empty list of tactics"
+                )
+            names = list(
+                dict.fromkeys(
+                    name
+                    for name in (normalize_tactic(str(value)) for value in ranking)
+                    if name in TACTIC_SET
+                )
+            )
+            if not names:
+                raise ValueError(
+                    f"{path}:{lineno}: ranking holds no known tactics: {ranking!r}"
+                )
+            pools[key] = tuple(names)
+    if not pools:
+        raise ValueError(f"{path} contains no row pools")
+    return pools
+
+
 def build_training_record(
     row: Mapping[str, Any],
     *,
@@ -329,9 +450,8 @@ def build_training_record(
             f"tactic family {target!r} is not in the canonical catalog "
             "(see tactic_choose.py)",
         )
-    option_list, gold_in_pool = candidates.for_row(
-        target, row_key=_row_key(row, raw_state)
-    )
+    row_key = _row_key(row, raw_state)
+    option_list, gold_in_pool = candidates.for_row(target, row_key=row_key)
     try:
         translated_state = translate_lean_state(raw_state)
     except InvalidRowError:
@@ -339,6 +459,16 @@ def build_training_record(
     except (ValueError, TypeError) as exc:
         raise InvalidRowError("state_invalid", str(exc)) from exc
     arguments = raw_tactic[len(target):].strip() if raw_tactic.startswith(target) else ""
+    metadata = {
+        "candidate_count": len(option_list),
+        "candidate_order": option_list,
+        "gold_in_pool": gold_in_pool,
+        "prompt_version": "lean-tactic-family-v3",
+    }
+    if candidates.row_pools:
+        # Only tagged when row pools are configured at all, so legacy
+        # records keep their exact schema.
+        metadata["row_pool_matched"] = candidates.matched(row_key)
     return {
         "state": translated_state,
         "raw_state": raw_state,
@@ -350,12 +480,7 @@ def build_training_record(
             "application": raw_tactic,
             "description": translate_tactic_step(target, arguments),
         },
-        "metadata": {
-            "candidate_count": len(option_list),
-            "candidate_order": option_list,
-            "gold_in_pool": gold_in_pool,
-            "prompt_version": "lean-tactic-family-v3",
-        },
+        "metadata": metadata,
         "tags": ["atp", "laya-retrain"],
         "row_index": row.get("row_index"),
     }
@@ -434,6 +559,7 @@ def _sampler_for(config: RetrainConfig) -> GoldRandomCandidates:
         config.resolved_pool,
         options_per_row=config.options_per_row,
         seed=config.seed,
+        row_pools=config.row_pools,
     )
 
 
@@ -843,6 +969,15 @@ def preflight(
         f"{config.distractor_pool_source}"
     )
     print(f"                 : {shown}")
+    if config.row_pools:
+        print(
+            f"  row pools     : {len(config.row_pools):,} per-row GNN pools from "
+            f"{config.row_pools_source}"
+        )
+        print(
+            "                 : distractors come from each row's own ranking; "
+            "rows without a pool fall back to the common tactics above"
+        )
     if len(sampler.pool) < config.options_per_row:
         print(
             f"  warning        : the pool holds only {len(sampler.pool)} tactics, so "
@@ -900,6 +1035,19 @@ def preflight(
             print(f"  sample        : {len(prepared)} records previewed ({option_note})")
         else:
             print(f"  candidates    : {option_note}")
+        if config.row_pools and prepared:
+            preview_matched = sum(
+                1 for record in prepared if record["metadata"].get("row_pool_matched")
+            )
+            print(
+                f"  row pools     : {preview_matched}/{len(prepared)} previewed rows "
+                "matched a per-row pool"
+            )
+            if not preview_matched:
+                print(
+                    "                 : WARNING — no matches; every row would fall "
+                    "back to the global pool (do the row_index keys line up?)"
+                )
         if total:
             estimated_bytes = int(average * total)
             print(
@@ -983,6 +1131,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="tactics the distractors are drawn from: a comma-separated list, "
              "or a dataset file whose most common tactics become the pool "
              "(default: computed from the dataset being translated)",
+    )
+    parser.add_argument(
+        "--row-pools",
+        type=Path,
+        metavar="PATH",
+        help="per-row GNN candidate pools from `pipeline.py pools` (JSONL); each "
+             "row's distractors come from its own GNN ranking (the hard negatives "
+             "inference presents), falling back to --distractor-pool for rows "
+             "without a pool",
     )
     parser.add_argument(
         "--device",
@@ -1094,11 +1251,14 @@ def _resolve_distractor_pool(
 
 def _run(args: argparse.Namespace) -> int:
     pool, pool_source = _resolve_distractor_pool(args.distractor_pool, args.dataset)
+    row_pools = load_row_pools(args.row_pools) if args.row_pools else {}
     config = RetrainConfig(
         dataset_path=args.dataset,
         output_path=args.output,
         distractor_pool=pool,
         distractor_pool_source=pool_source,
+        row_pools=row_pools,
+        row_pools_source=str(args.row_pools) if args.row_pools else "",
         seed=args.seed,
         device=args.device,
         strict=args.strict,

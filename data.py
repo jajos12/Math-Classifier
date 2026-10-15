@@ -9,6 +9,30 @@ from typing import Any
 REQUIRED_COLUMNS = frozenset({"row_index", "theorem", "tactic", "text_state"})
 
 
+def pool_row_key(value: Any) -> str:
+    """Canonical string form of a dataset ``row_index``.
+
+    The same index must produce the same key whether it arrives as an int
+    (parquet/JSON), a float-rendered column value (``123.0``), or a string
+    with stray whitespace — every per-row lookup (candidate pools, overlap
+    checks) depends on that. Returns ``""`` for missing values.
+    """
+    if value is None:
+        return ""
+    if type(value).__name__ in {"NAType", "NaTType"}:
+        return ""
+    if isinstance(value, float) and value != value:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "<na>", "none"}:
+        return ""
+    if text.endswith(".0"):
+        head = text[:-2]
+        if head.lstrip("-").isdigit():
+            return head
+    return text
+
+
 def discover_dataset_shards(repo: str, split: str = "test") -> list[str]:
     from huggingface_hub import HfApi
     prefix = f"{split}/"

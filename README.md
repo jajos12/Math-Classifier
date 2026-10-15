@@ -361,9 +361,10 @@ tactic
 
 A `row_index` column is optional but recommended: it keys the per-row
 distractor draw (making records reproducible and letting the eval-overlap
-guard match rows cheaply). Without it, a stable hash of the proof state is
-used instead. If the dataset already exists elsewhere, use its actual path
-instead of `data/train.parquet`; the file is not created by cloning the repo.
+guard and the `--row-pools` hard-negative pools match rows cheaply). Without
+it, a stable hash of the proof state is used instead. If the dataset already
+exists elsewhere, use its actual path instead of `data/train.parquet`; the
+file is not created by cloning the repo.
 
 ### 3. Prepare and preview the Laya records
 
@@ -443,7 +444,9 @@ Each record contains:
 - `expected.application`: the original tactic application, such as `rw [h]`.
 - `expected.tactic`: the normalized tactic family, such as `rw`.
 - `metadata`: the 10-option order, the option count, whether the gold tactic
-  was in the common pool, and the prompt version.
+  was in the offered pool (the row's own GNN ranking under `--row-pools`,
+  otherwise the common pool), the prompt version, and — when `--row-pools`
+  is configured — whether this row matched a per-row pool.
 
 The translated state preserves Lean identifiers and expressions while expanding
 common logical symbols into readable phrases. This gives Laya both exact names
@@ -475,6 +478,41 @@ Because nothing about the option set or the gold position depends on the row's
 *position in the file*, the draws are stable across runs, unaffected by
 `--limit`/`--sample`, and reproducible when a second file is translated with
 the same pool (`--distractor-pool`, below).
+
+#### Hard negatives: per-row GNN pools (`--row-pools`)
+
+Random common-tactic distractors are *easy* — almost none of them could
+plausibly solve the state, so a model trained on them learns a coarse
+plausibility filter that does not transfer to the benchmark, where all 10
+candidates come from the GNN's top-10 and are all plausible. `--row-pools
+PATH` closes that gap by letting each row draw its 9 distractors from **its
+own GNN ranking**:
+
+```bash
+# once per split: score the whole train split and write per-row top-k pools
+# (resumes if interrupted; --limit N scores only the first N rows as a smoke test)
+python3 pipeline.py pools --split train --out data/train-pools.jsonl --device cuda:0
+
+# translation draws each row's distractors from its own ranking
+python3 laya_retrain.py data/train_fit.parquet outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl --fine-tune --device cuda:1 ...
+```
+
+- The file is JSONL, one row per line:
+  `{"row_index": ..., "target": ..., "ranking": [...], "scores": [...]}`.
+- When the gold tactic is inside the row's ranking, the distractors are
+  exactly the other 9 candidates; when it is outside (the benchmark's
+  recall@k ceiling, ~14% of test rows), gold is inserted anyway and the row
+  is counted in `gold_inserted`, as in the default mode.
+- Gold position stays uniformly random, options stay unique, and the trainer
+  still reshuffles every epoch — hard negatives change *which* tactics
+  compete, never how the answer is marked.
+- Rows without a pool (or a ranking shorter than 10) fall back to the
+  common-tactic draw, and the fallback count is reported. Pre-flight also
+  prints how many sampled rows matched, so a `row_index` keying mismatch is
+  visible before training starts.
+- Translate the validation half with the **same** `--row-pools` file, so the
+  held-out metric measures exactly the skill the benchmark measures.
 
 **Nothing else varies.** Every candidate — gold or distractor — gets the same
 kind of description and the same state-dependent hints, drawn only from the
@@ -523,6 +561,11 @@ python3 laya_retrain.py \
     outputs/laya_validation.jsonl \
     --distractor-pool data/train_fit.parquet
 ```
+
+When fine-tuning with `--row-pools`, pass the same pools file here as well
+(`data/train-pools.jsonl` covers the whole train split, so the validation rows
+have entries too); `--distractor-pool` stays as the fallback for rows without
+a pool, and the stats sidecar reports how many rows matched.
 
 `outputs/laya_validation.jsonl` is only the Laya eval file — the benchmark
 test split used by the post-training comparison is a different, untouched
@@ -847,13 +890,18 @@ visibility, missing eval file) without touching the GPU.
   state). `pipeline.py split` carves the disjoint pair, and
   `--allow-eval-overlap` overrides the check when the overlap is intended.
 - Every training record is a 10-way decision: the gold tactic plus 9 unique
-  distractors drawn from the corpus's 20 most common tactics. The gold sits
-  at a uniformly random index, distractors are redrawn per row, and the
+  distractors. By default they are drawn from the corpus's 20 most common
+  tactics; with `--row-pools` (from `pipeline.py pools`) each row draws from
+  its own GNN top-k ranking — the hard negatives inference presents. The gold
+  sits at a uniformly random index, distractors are redrawn per row, and the
   option order is reshuffled every epoch — so neither position, ordering, nor
   distractor identity leaks the answer, and training matches the GNN top-10
   reranking shape at inference. `outputs/laya_train.stats.json` records the
-  pool, the per-row option counts, and the `gold_in_pool`/`gold_inserted`
-  split.
+  pool, the per-row option counts, the `gold_in_pool`/`gold_inserted`
+  split, and (under `--row-pools`) how many rows matched a per-row pool.
+  Row pools key on the canonicalized `row_index` — `123`, `123.0`, and
+  `" 123 "` are the same key — and rows without a pool silently fall back to
+  the common-tactic draw, counted in the sidecar.
 - Every run appends to `outputs/history.jsonl` and writes
   `outputs/environment.json`, so results remain attributable after outputs
   are overwritten.

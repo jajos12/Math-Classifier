@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from comparison import (
     append_history,
@@ -15,7 +16,13 @@ from comparison import (
     write_environment,
 )
 from config import ExperimentConfig
-from data import download_dataset, load_dataset, sample_dataset, split_dataset
+from data import (
+    download_dataset,
+    load_dataset,
+    pool_row_key,
+    sample_dataset,
+    split_dataset,
+)
 from evaluation import build_report, print_summary, write_metrics_image, write_report
 from graph import normalize_tactic, proof_state_to_dag
 from gnn import build_graphs, build_model, download_bundle, load_bundle, predict_top_k
@@ -71,6 +78,40 @@ def _parser() -> argparse.ArgumentParser:
     )
     split.add_argument(
         "--seed", type=int, default=42, help="seed for the row assignment (default: 42)"
+    )
+    pools = subparsers.add_parser(
+        "pools",
+        help="score a dataset split with the GNN and write per-row top-k pools "
+             "(hard negatives for laya_retrain --row-pools)",
+    )
+    pools.add_argument(
+        "--split", default="train", help="dataset split to score (default: train)"
+    )
+    pools.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="JSONL output; pools already in the file are resumed, not recomputed",
+    )
+    pools.add_argument(
+        "--device",
+        default="auto",
+        metavar="DEVICE",
+        help="GNN device: auto, cpu, cuda, cuda:0, ... (default: auto)",
+    )
+    pools.add_argument(
+        "--limit", type=int, metavar="N", help="score only the first N rows (smoke test)"
+    )
+    pools.add_argument(
+        "--chunk",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="rows per graph-building pass (default: 4096)",
+    )
+    pools.add_argument(
+        "--force", action="store_true", help="overwrite --out instead of resuming it"
     )
     return parser
 
@@ -204,6 +245,89 @@ def _dispatch(argv: list[str] | None = None) -> int:
             print(f"WARNING: {device_note['warning']}")
         print(f"run history    : {history}")
         print(f"environment    : {environment}")
+    elif args.command == "pools":
+        if args.chunk < 1:
+            raise ValueError("--chunk must be positive")
+        if args.limit is not None and args.limit < 1:
+            raise ValueError("--limit must be positive")
+        from laya_trainer import validate_device
+
+        config = ExperimentConfig(split=args.split, device=args.device)
+        config.prepare_directories()
+        validate_device(config.resolved_device, label="--device")
+        out: Path = args.out
+        done = _resume_pools(out, force=args.force)
+        paths = download_dataset(config.dataset_repo, config.split, config.dataset_dir)
+        frame = load_dataset(paths)
+        if args.limit is not None:
+            frame = frame.head(args.limit)
+        pending, unusable = _pending_pool_rows(frame, done)
+        print(
+            f"split {config.split}: {len(frame):,} rows — {len(done):,} already "
+            f"pooled, {len(pending):,} to score"
+            + (f", {unusable} unusable (missing row_index/text_state)" if unusable else ""),
+            flush=True,
+        )
+        if pending:
+            bundle = load_bundle(
+                download_bundle(config.model_repo, config.bundle_name, config.model_dir)
+            )
+            model, _ = build_model(bundle)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            started = time.monotonic()
+            before = len(done)
+            written = len(done)
+            hits = 0
+            failed = 0
+            with out.open("a", encoding="utf-8") as handle:
+                for start in range(0, len(pending), args.chunk):
+                    chunk = pending[start:start + args.chunk]
+                    scored = _score_chunk(model, bundle, chunk, config)
+                    for (key, _, target), (ranking, scores) in zip(chunk, scored):
+                        if not ranking:
+                            failed += 1
+                            continue
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "row_index": key,
+                                    "target": target,
+                                    "ranking": [str(name) for name in ranking],
+                                    "scores": [
+                                        round(float(value), 5) for value in scores
+                                    ],
+                                }
+                            )
+                            + "\n"
+                        )
+                        written += 1
+                        if target and target in ranking:
+                            hits += 1
+                    handle.flush()
+                    covered = min(start + args.chunk, len(pending))
+                    elapsed = max(time.monotonic() - started, 1e-9)
+                    rate = (written - before) / elapsed
+                    eta = (len(pending) - covered) / rate if rate else 0.0
+                    print(
+                        f"  pools: {written:,} total, {covered:,}/{len(pending):,} "
+                        f"this run ({rate:.0f} rows/s, ETA {_eta(eta)})",
+                        flush=True,
+                    )
+            elapsed = time.monotonic() - started
+            scored_count = written - before
+            print(
+                f"\nwrote {scored_count:,} new pools to {out} "
+                f"({len(done):,} resumed, {failed} failed) in {int(elapsed)}s"
+            )
+            if scored_count:
+                print(f"  file now holds {written:,} pools ({out.stat().st_size / 1e6:.1f} MB)")
+                print(
+                    f"  gold in top-{config.pool_k}: {hits}/{scored_count} "
+                    f"({hits / scored_count:.1%}) of this run's rows — the "
+                    "recall@k ceiling at inference"
+                )
+        else:
+            print(f"nothing to do: {out} already covers this selection")
     elif args.command == "split":
         source = args.dataset
         train_out = source.parent / f"{source.stem}_fit{source.suffix}"
@@ -230,6 +354,120 @@ def _dispatch(argv: list[str] | None = None) -> int:
             "the validation file for --eval-data"
         )
     return 0
+
+
+def _resume_pools(path: Path, *, force: bool = False) -> set[str]:
+    """Row keys already present in ``path``; repairs a file cut off mid-write.
+
+    A crashed run can leave a partial last line behind. Unreadable rows are
+    dropped (they were never completed) and the readable ones are kept, so
+    rerunning the same command resumes instead of duplicating or losing
+    pools. A file that holds no readable pool row at all is refused — it is
+    probably not a pools file — unless ``force`` overwrites it outright.
+    """
+    path = Path(path)
+    if force:
+        path.unlink(missing_ok=True)
+        return set()
+    if not path.is_file():
+        return set()
+    done: set[str] = set()
+    kept: list[str] = []
+    dropped = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+            key = pool_row_key(payload.get("row_index")) if isinstance(payload, dict) else ""
+            if not key or not isinstance(payload.get("ranking"), list):
+                raise ValueError("incomplete pool row")
+        except (json.JSONDecodeError, ValueError):
+            dropped += 1
+            continue
+        done.add(key)
+        kept.append(line)
+    if dropped and not kept:
+        raise ValueError(
+            f"{path} holds no readable pool rows; it does not look like a "
+            "pools file — pass --force to overwrite it"
+        )
+    if dropped:
+        path.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+        print(f"repaired {path}: dropped {dropped} unreadable line(s)")
+    return done
+
+
+def _pending_pool_rows(frame, done: set[str]) -> tuple[list[tuple[str, str, str]], int]:
+    """(key, state, target) rows still to score, plus the unusable-row count."""
+    pending: list[tuple[str, str, str]] = []
+    unusable = 0
+    for raw_key, raw_state, raw_target in zip(
+        frame["row_index"].tolist(),
+        frame["text_state"].tolist(),
+        frame["tactic"].tolist(),
+    ):
+        key = pool_row_key(raw_key)
+        state = raw_state.strip() if isinstance(raw_state, str) else ""
+        if not key or not state:
+            unusable += 1
+            continue
+        if key in done:
+            continue
+        try:
+            target = normalize_tactic(str(raw_target))
+        except Exception:
+            target = ""
+        pending.append((key, state, target))
+    return pending, unusable
+
+
+def _score_chunk(model, bundle, chunk, config) -> list[tuple[list, list]]:
+    """GNN top-k for every row of one chunk: ``(ranking, scores)`` each.
+
+    One unparseable state must not cost a whole chunk of a multi-hour build,
+    so a failed chunk is retried row by row; rows that still fail come back
+    with an empty ranking and are skipped by the caller.
+    """
+    states = [state for _, state, _ in chunk]
+    edge_mode = bundle.config["edge_mode"]
+    try:
+        graphs = build_graphs(states, bundle, edge_mode=edge_mode)
+        rankings, scores = predict_top_k(
+            model,
+            graphs,
+            bundle,
+            config.pool_k,
+            batch_size=config.batch_size,
+            device=config.resolved_device,
+        )
+        return [(list(ranking), list(score)) for ranking, score in zip(rankings, scores)]
+    except Exception:  # noqa: BLE001 - fallback path, failures reported per row
+        results = []
+        for state in states:
+            try:
+                graphs = build_graphs([state], bundle, edge_mode=edge_mode)
+                ranking, score = predict_top_k(
+                    model,
+                    graphs,
+                    bundle,
+                    config.pool_k,
+                    batch_size=1,
+                    device=config.resolved_device,
+                )
+                results.append((list(ranking[0]), list(score[0])))
+            except Exception:
+                results.append(([], []))
+        return results
+
+
+def _eta(seconds: float) -> str:
+    total = int(seconds)
+    if total >= 3600:
+        return f"{total // 3600}h{total % 3600 // 60:02d}m"
+    if total >= 60:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total}s"
 
 
 if __name__ == "__main__":
