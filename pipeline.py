@@ -242,11 +242,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
             states,
             gnn_rankings,
             mode=config.laya_mode,
-            threshold=config.laya_confidence_threshold,
         )
         laya_rankings = outcome["rankings"]
-        laya_confidences = outcome["confidences"]
-        laya_fallbacks = outcome["fallbacks"]
         del adapter
         report = build_report(
             gnn_rankings, laya_rankings, targets,
@@ -259,8 +256,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
         report["pool_k"] = config.pool_k
         report["laya_mode"] = config.laya_mode
         report["laya_model"] = config.laya_model
-        report["laya_confidence_threshold"] = config.laya_confidence_threshold
-        report["laya_fallbacks"] = laya_fallbacks
         report["laya_device"] = device_note
         report["gnn_device"] = config.resolved_device
         output = write_report(report, config.resolved_output_dir / "metrics.json")
@@ -271,7 +266,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     "targets": targets,
                     "gnn": gnn_rankings,
                     "laya": laya_rankings,
-                    "laya_confidences": laya_confidences,
                     "gnn_scores": gnn_scores,
                 },
                 indent=2,

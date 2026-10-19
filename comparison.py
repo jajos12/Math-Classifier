@@ -37,29 +37,21 @@ def rerank_states(
     gnn_rankings: Sequence[Sequence[str]],
     *,
     mode: str = "standard",
-    threshold: float = 0.0,
 ) -> dict[str, Any]:
-    """Rerank one GNN pool with one Laya adapter, row by row.
+    """Rerank one candidate pool with Laya, row by row.
 
-    When Laya's ``answer_confidence`` is below ``threshold`` the GNN order is
-    kept, which counts as a fallback in the report.
+    Laya ranks the pool by itself: its own probability order is always the
+    result. The GNN only supplies the candidate set — its order is never kept
+    or blended in, so the two systems stay separate.
     """
     rankings: list[list[str]] = []
-    confidences: list[float] = []
-    fallbacks = 0
     for state, candidates in zip(states, gnn_rankings):
         if mode == "balanced":
             result = adapter.balanced_predict(state, candidates)
         else:
             result = adapter.predict(state, candidates)
-        confidence = float(result.get("answer_confidence", 0.0))
-        if confidence < threshold:
-            rankings.append(list(candidates))
-            fallbacks += 1
-        else:
-            rankings.append(list(result["order"]))
-        confidences.append(confidence)
-    return {"rankings": rankings, "confidences": confidences, "fallbacks": fallbacks}
+        rankings.append(list(result["order"]))
+    return {"rankings": rankings}
 
 
 def describe_device(agent: Any, requested: str) -> dict[str, Any]:
@@ -212,7 +204,6 @@ def compare_checkpoints(
             pool["states"],
             pool["gnn_rankings"],
             mode=config.laya_mode,
-            threshold=config.laya_confidence_threshold,
         )
         elapsed = time.monotonic() - started
         reranked = build_report(
@@ -222,11 +213,6 @@ def compare_checkpoints(
             pool_k=config.pool_k,
             select_k=config.select_k,
         )
-        mean_confidence = (
-            sum(outcome["confidences"]) / len(outcome["confidences"])
-            if outcome["confidences"]
-            else 0.0
-        )
         entries[name] = {
             "model": model_id,
             "laya_device": device_note,
@@ -234,8 +220,6 @@ def compare_checkpoints(
             "metrics": reranked["metrics"]["laya"],
             "conditional": reranked["metrics"]["laya"].get("conditional", {}),
             "transitions": reranked["transitions"],
-            "fallbacks": outcome["fallbacks"],
-            "mean_confidence": round(mean_confidence, 4),
             "elapsed_seconds": round(elapsed, 1),
         }
         print(
@@ -258,7 +242,6 @@ def compare_checkpoints(
         "pool_k": config.pool_k,
         "select_k": config.select_k,
         "laya_mode": config.laya_mode,
-        "laya_confidence_threshold": config.laya_confidence_threshold,
         "pool_cached": bool(pool.get("cached")),
         "gnn": {
             "metrics": baseline["metrics"]["gnn"],
@@ -428,16 +411,14 @@ def write_comparison_image(report: Mapping[str, Any], path: Path) -> Path:
         f"Pool recall    : {report.get('target_in_pool', 0.0):.3f}",
         f"Laya mode      : {report.get('laya_mode')}",
         "",
-        "Confidence and fallbacks:",
+        "Device notes:",
     ]
     for name, entry in report.get("models", {}).items():
-        lines.append(
-            f"  {name:<10} mean conf {entry.get('mean_confidence', 0.0):.3f}, "
-            f"fallbacks {entry.get('fallbacks', 0)}"
-        )
         warning = entry.get("laya_device", {}).get("warning")
         if warning:
-            lines.append(f"  {'':<10} WARNING: {warning}")
+            lines.append(f"  {name:<10} WARNING: {warning}")
+    if not any(entry.get("laya_device", {}).get("warning") for entry in report.get("models", {}).values()):
+        lines.append("  (none)")
     if option_count.get("mismatch"):
         lines.extend(
             (
@@ -477,8 +458,6 @@ def append_history(report: Mapping[str, Any], output_dir: Path) -> Path:
                 for key in (f"recall@{report.get('pool_k', 10)}", "recall@5", "recall@1", "mrr@10")
                 if entry.get("metrics", {}).get(key) is not None
             },
-            "mean_confidence": entry.get("mean_confidence"),
-            "fallbacks": entry.get("fallbacks"),
             "device": entry.get("laya_device", {}).get("actual"),
             "warning": entry.get("laya_device", {}).get("warning"),
             "elapsed_seconds": entry.get("elapsed_seconds"),
@@ -494,7 +473,6 @@ def append_history(report: Mapping[str, Any], output_dir: Path) -> Path:
         "pool_k": report.get("pool_k"),
         "select_k": report.get("select_k"),
         "laya_mode": report.get("laya_mode"),
-        "laya_confidence_threshold": report.get("laya_confidence_threshold"),
         "gnn_metrics": _metrics_subset(report.get("gnn", {}).get("metrics", {}), report.get("pool_k", 10)),
         "models": models,
         "option_count": report.get("option_count"),

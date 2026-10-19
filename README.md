@@ -133,8 +133,12 @@ python3 pipeline.py benchmark \
     --laya-mode balanced
 ```
 
-The benchmark records the selected mode and the number of GNN fallbacks in
-`outputs/metrics.json` and `outputs/predictions.json`.
+The two systems stay separate at inference: the GNN supplies the candidate
+set and keeps its own ranking, and Laya ranks that set with its own
+probabilities — there is no confidence threshold, fallback, or blending
+between them. The benchmark records the selected mode in
+`outputs/metrics.json`; `outputs/predictions.json` stores the GNN and Laya
+rankings side by side.
 
 CPU and automatic selection are also supported:
 
@@ -728,7 +732,7 @@ and writes:
 
 ```text
 outputs/comparison.json   full metrics per checkpoint, option counts, acceptance gates, environment
-outputs/comparison.png    recall chart plus confidence/fallback and acceptance notes
+outputs/comparison.png    recall chart plus device and acceptance notes
 outputs/history.jsonl     one appended line for this run (including the verdict)
 ```
 
@@ -758,12 +762,11 @@ recorded in the same place.
   `outputs/comparison.json` and `history.jsonl`; never read a constructed
   pool's recall@10 as a system metric.
 - **Calibration warning.** Loading Laya prints a
-  `RuntimeWarning: ... uncalibrated` line about probability adjustment. It
-  means `answer_confidence` is not trustworthy on that checkpoint yet. The
+  `RuntimeWarning: ... uncalibrated` line about probability adjustment. The
   warnings captured while loading each checkpoint are stored under
   `load_warnings` in `outputs/comparison.json` and `models.<name>.warning` in
-  `history.jsonl`. Until a checkpoint is recalibrated, read the recall numbers
-  rather than the confidences.
+  `history.jsonl`. Inference itself never consults a confidence value — Laya's
+  probability order is the ranking — so the recall numbers are what to read.
 - **Laya on CPU.** If Laya cannot use the requested GPU it falls back to CPU
   silently from its own perspective. The comparison detects this, warns, and
   records `laya_device.requested` / `laya_device.actual` so a slow or
