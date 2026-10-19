@@ -15,11 +15,22 @@ from tactic_choose import TACTIC_SET
 
 DEFAULT_GLOSS = "a Lean 4 tactic family; choose it only when its name matches the proof step"
 DEFAULT_INSTRUCTIONS = (
-    "Analyze the Lean proof state and determine which proof action is most useful next. "
-    "Use the current goal together with the local hypotheses: look for hypotheses that "
-    "can be applied, rewritten, simplified, destructured, or used in arithmetic. "
-    "Consider the candidate tactic descriptions as hints about the actions they perform, "
-    "then rank the available actions by how well they fit this particular state."
+    "This is a multiple-choice question about a Lean 4 proof: from the candidate "
+    "tactics listed with this state, pick the one that is the correct next tactic. "
+    "Read the state as a whole first — the goal says what still has to be proved, "
+    "and the local hypotheses say what you have to work with: a fact to rewrite "
+    "with, apply, simplify, case-split, or feed to arithmetic. Every candidate "
+    "comes with a short description of what that tactic does; use it to picture "
+    "what would actually happen if you ran the tactic on this exact state. Cross "
+    "out the options that cannot apply here, would leave the goal unchanged, or "
+    "head in a different direction, and keep the ones that make concrete progress "
+    "toward the goal as written — if several still fit, prefer the one that uses "
+    "the hypotheses most directly. "
+    "Answer with a probability for every candidate: how likely each one is to be "
+    "the correct choice, with the values summing to 1 across the list. These "
+    "numbers express how confident you are in the right answer, not how useful you "
+    "find an option — a hesitant question spreads its probability out, a clear one "
+    "concentrates it."
 )
 TACTIC_GLOSS: dict[str, str] = {
     ".": "move on to the next goal in the list",

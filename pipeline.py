@@ -17,6 +17,8 @@ from comparison import (
 )
 from config import ExperimentConfig
 from data import (
+    audit_splits,
+    combine_shards,
     download_dataset,
     load_dataset,
     pool_row_key,
@@ -37,6 +39,41 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "runtime",
         help="show the Python environment, Torch, CUDA, and visible GPUs",
+    )
+    audit = subparsers.add_parser(
+        "audit",
+        help="check the dataset splits for duplicate rows, within and across splits",
+    )
+    audit.add_argument(
+        "--splits",
+        default="train,val,test",
+        metavar="A,B,C",
+        help="comma-separated split names to audit (default: train,val,test)",
+    )
+    audit.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="audit report path (default: outputs/audit.json)",
+    )
+    fetch = subparsers.add_parser(
+        "fetch",
+        help="download one Hugging Face split and optionally combine its shards",
+    )
+    fetch.add_argument("--split", default="val", help="split to download (default: val)")
+    fetch.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="combine the shards into this file (default: data/<split>.parquet)",
+    )
+    fetch.add_argument(
+        "--no-combine",
+        dest="combine",
+        action="store_false",
+        help="download the shards without combining them into one file",
     )
     benchmark = subparsers.add_parser("benchmark", help="run GNN and Laya ranking evaluation")
     benchmark.add_argument("--rows", type=int, default=500, help="number of rows to evaluate")
@@ -165,6 +202,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
             print(f"cuda_device_count: {torch.cuda.device_count()}")
             for index in range(torch.cuda.device_count()):
                 print(f"cuda:{index}: {torch.cuda.get_device_name(index)}")
+    elif args.command == "audit":
+        return _cmd_audit(args)
+    elif args.command == "fetch":
+        return _cmd_fetch(args)
     elif args.command == "benchmark":
         config = ExperimentConfig(
             n_rows=args.rows,
@@ -353,6 +394,68 @@ def _dispatch(argv: list[str] | None = None) -> int:
             "  the two files share no rows: train on the train file, and translate "
             "the validation file for --eval-data"
         )
+    return 0
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    """Audit dataset splits for duplicate rows and record the result."""
+    config = ExperimentConfig()
+    config.prepare_directories()
+    names = [name.strip() for name in args.splits.split(",") if name.strip()]
+    if len(names) < 2:
+        raise ValueError("--splits needs at least two split names (e.g. train,val,test)")
+    splits = {
+        name: download_dataset(config.dataset_repo, name, config.dataset_dir)
+        for name in names
+    }
+    report = audit_splits(splits)
+    out: Path = args.out or config.resolved_output_dir / "audit.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print(f"audit: {config.dataset_repo} splits {', '.join(names)}")
+    for name, entry in report["splits"].items():
+        print(
+            f"  {name:<6} {entry['rows']:>7,} rows — "
+            f"{entry['unique_row_index']:,} unique row_index, "
+            f"{entry['unique_state']:,} unique states, "
+            f"within-split dupes {entry['duplicate_row_index']} (index) / "
+            f"{entry['duplicate_state']} (state)"
+        )
+    for pair, entry in report["overlaps"].items():
+        left, right = pair.split("|")
+        status = "ok" if not entry["row_index"] and not entry["state"] else "DUPLICATES"
+        print(
+            f"  {left} vs {right}: {status} — "
+            f"{entry['row_index']} shared row_index, {entry['state']} shared states"
+        )
+        if status != "ok":
+            print(f"    row_index examples: {entry['row_index_examples']}")
+            print(f"    state hash examples: {entry['state_examples']}")
+    print(f"report: {out}")
+    if not report["passed"]:
+        print(
+            "audit FAILED: the splits share rows, so held-out metrics would be "
+            "contaminated; remove the duplicates before training",
+            file=sys.stderr,
+        )
+        return 1
+    print("audit passed: no cross-split duplicate rows")
+    return 0
+
+
+def _cmd_fetch(args: argparse.Namespace) -> int:
+    """Download one split and optionally combine its shards into one file."""
+    config = ExperimentConfig()
+    config.prepare_directories()
+    paths = download_dataset(config.dataset_repo, args.split, config.dataset_dir)
+    for path in paths:
+        print(f"shard: {path}")
+    if not args.combine:
+        return 0
+    output: Path = args.out or config.work_dir / "data" / f"{args.split}.parquet"
+    combined, rows = combine_shards(paths, output)
+    print(f"combined {len(paths)} shard(s) → {combined} ({rows:,} rows)")
     return 0
 
 

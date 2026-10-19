@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from laya_adapter import DEFAULT_INSTRUCTIONS
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -18,13 +20,9 @@ class ExperimentConfig:
     select_k: int = 5
     batch_size: int = 64
     laya_model: str = "convaiinnovations/laya"
-    laya_instructions: str = (
-        "Analyze the Lean proof state and determine which proof action is most useful next. "
-        "Use the current goal together with the local hypotheses: look for hypotheses that "
-        "can be applied, rewritten, simplified, destructured, or used in arithmetic. "
-        "Consider the candidate tactic descriptions as hints about the actions they perform, "
-        "then rank the available actions by how well they fit this particular state."
-    )
+    # One prompt for training and inference: Laya is asked to choose the best
+    # tactic, not to rank candidates, and its distribution is its confidence.
+    laya_instructions: str = DEFAULT_INSTRUCTIONS
     checkpoint_every: int = 50
     work_dir: Path = field(default_factory=Path.cwd)
     cache_dir: Path | None = None

@@ -267,7 +267,66 @@ def compare_checkpoints(
         "models": entries,
         "option_count": option_count,
         "target_in_pool": baseline["pool_recall"],
+        "acceptance": acceptance_block(
+            {
+                "gnn": {"metrics": baseline["metrics"]["gnn"]},
+                "models": entries,
+                "n": len(pool["states"]),
+            }
+        ),
         "environment": environment_record(),
+    }
+
+
+def acceptance_block(report: Mapping[str, Any]) -> dict[str, Any]:
+    """The run's accept/reject verdict on one fixed pool.
+
+    The fine-tune is accepted when, on the same rows and the same GNN top-10
+    pool, it beats the GNN itself on ``recall@5`` and ``mrr@10`` *and* beats
+    the base Laya checkpoint on ``recall@1``. Each gate records both values so
+    a FAIL line is self-explanatory in ``comparison.json`` and
+    ``history.jsonl``.
+    """
+    gnn = report.get("gnn", {}).get("metrics", {})
+    models = report.get("models", {})
+    finetuned = (models.get("finetuned") or {}).get("metrics", {})
+    base = (models.get("base") or {}).get("metrics", {})
+    gates: list[dict[str, Any]] = []
+
+    def gate(label: str, left: float, right: float) -> None:
+        gates.append(
+            {"gate": label, "left": left, "right": right, "pass": left > right}
+        )
+
+    for key in ("recall@5", "mrr@10"):
+        if key in finetuned and key in gnn:
+            gate(
+                f"finetuned.{key} > gnn.{key}",
+                float(finetuned[key]),
+                float(gnn[key]),
+            )
+    if "recall@1" in finetuned and "recall@1" in base:
+        gate(
+            "finetuned.recall@1 > base.recall@1",
+            float(finetuned["recall@1"]),
+            float(base["recall@1"]),
+        )
+    missing = []
+    if not ({"recall@5", "mrr@10"} <= finetuned.keys() and {"recall@5", "mrr@10"} <= gnn.keys()):
+        missing.append("finetuned/gnn metrics")
+    if "recall@1" not in finetuned or "recall@1" not in base:
+        missing.append("finetuned/base recall@1")
+    return {
+        "passed": bool(gates) and not missing and all(item["pass"] for item in gates),
+        "complete": not missing,
+        "missing": missing,
+        "rows": report.get("n"),
+        "gates": gates,
+        "note": (
+            "Accept only when every gate passes: the fine-tune must beat the "
+            "GNN on recall@5 and mrr@10, and the base Laya checkpoint on "
+            "recall@1, on the same pool and rows."
+        ),
     }
 
 
@@ -285,14 +344,17 @@ def _option_count_block(
         "training_option_counts": training_counts,
         "mismatch": mismatch,
         "gold_in_pool": (prep_stats or {}).get("gold_in_pool"),
-        "gold_inserted": (prep_stats or {}).get("gold_inserted"),
+        "target_source": (prep_stats or {}).get("target_source"),
+        "gnn_lambda": (prep_stats or {}).get("gnn_lambda"),
+        "mean_gold_mass": (prep_stats or {}).get("mean_gold_mass"),
         "rows_skipped": (prep_stats or {}).get("rows_skipped"),
         "skipped_by_reason": (prep_stats or {}).get("skipped_by_reason"),
         "training_output": (prep_stats or {}).get("output"),
         "note": (
             f"Training records presented {training_counts} options per row while "
             f"inference reranks the GNN top-{config.pool_k} pool; the option counts "
-            "differ and are recorded, not corrected."
+            "differ and are recorded, not corrected (short GNN rankings are kept "
+            "as-is, never padded)."
             if mismatch
             else None
         ),
@@ -384,6 +446,14 @@ def write_comparison_image(report: Mapping[str, Any], path: Path) -> Path:
                 f"candidates, training used {option_count.get('training_option_counts')}.",
             )
         )
+    acceptance = report.get("acceptance")
+    if isinstance(acceptance, dict) and acceptance.get("gates"):
+        lines.extend(("", f"Acceptance: {'PASS' if acceptance.get('passed') else 'FAIL'}"))
+        for item in acceptance["gates"]:
+            mark = "ok  " if item.get("pass") else "FAIL"
+            lines.append(
+                f"  {mark} {item['gate']} ({item['left']:.3f} vs {item['right']:.3f})"
+            )
     axes[1].axis("off")
     axes[1].text(0.0, 1.0, "\n".join(lines), va="top", fontsize=10, family="monospace")
     figure.suptitle("GNN pool reranked by Laya checkpoints", fontsize=15)
@@ -428,6 +498,7 @@ def append_history(report: Mapping[str, Any], output_dir: Path) -> Path:
         "gnn_metrics": _metrics_subset(report.get("gnn", {}).get("metrics", {}), report.get("pool_k", 10)),
         "models": models,
         "option_count": report.get("option_count"),
+        "acceptance": report.get("acceptance"),
         "environment": report.get("environment"),
     }
     with path.open("a", encoding="utf-8") as handle:

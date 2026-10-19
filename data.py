@@ -1,8 +1,11 @@
-"""Dataset download, validation, deterministic sampling, and split carving."""
+"""Dataset download, validation, deterministic sampling, split carving, and audits."""
 
 from __future__ import annotations
 
+import hashlib
 import random
+import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +72,139 @@ def sample_dataset(frame, rows: int, seed: int):
     if rows >= len(frame):
         return frame.reset_index(drop=True)
     return frame.sample(n=rows, random_state=seed).sort_index().reset_index(drop=True)
+
+
+def combine_shards(paths: Sequence[Path], output: Path) -> tuple[Path, int]:
+    """Concatenate downloaded shards into one file; returns (path, row count)."""
+    import pandas as pd
+
+    if not paths:
+        raise ValueError("no shards to combine")
+    frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    suffix = output.suffix.lower()
+    if suffix == ".parquet":
+        frame.to_parquet(output, index=False)
+    elif suffix == ".csv":
+        frame.to_csv(output, index=False)
+    elif suffix in {".jsonl", ".json"}:
+        frame.to_json(output, orient="records", lines=suffix == ".jsonl")
+    else:
+        raise ValueError(f"unsupported output format {suffix!r}; use .parquet, .csv or .jsonl")
+    return output, len(frame)
+
+
+def state_fingerprint(text: Any) -> str:
+    """Stable content hash of a proof state, for cross-split duplicate detection."""
+    if text is None:
+        return ""
+    if isinstance(text, float) and text != text:  # NaN
+        return ""
+    cleaned = str(text).strip()
+    if not cleaned or cleaned.lower() in {"nan", "<na>", "none"}:
+        return ""
+    return hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
+def _split_keys(path: Path) -> tuple[int, set[str], set[str], int, int]:
+    """Stream one parquet shard into (rows, row_index keys, state hashes, blank keys, blank states)."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "auditing parquet needs pyarrow; install it with `pip install pyarrow`"
+        ) from exc
+    try:
+        file = pq.ParquetFile(path)
+        names = set(file.schema_arrow.names)
+        missing = {"row_index", "text_state"} - names
+        if missing:
+            raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+        rows = blank_key = blank_state = 0
+        keys: set[str] = set()
+        hashes: set[str] = set()
+        for batch in file.iter_batches(batch_size=2000, columns=["row_index", "text_state"]):
+            indices = batch.column(0).to_pylist()
+            states = batch.column(1).to_pylist()
+            for raw_key, raw_state in zip(indices, states):
+                rows += 1
+                key = pool_row_key(raw_key)
+                if key:
+                    keys.add(key)
+                else:
+                    blank_key += 1
+                digest = state_fingerprint(raw_state)
+                if digest:
+                    hashes.add(digest)
+                else:
+                    blank_state += 1
+        return rows, keys, hashes, blank_key, blank_state
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"failed to read parquet dataset {path}") from exc
+
+
+def audit_splits(splits: Mapping[str, Sequence[Path]]) -> dict[str, Any]:
+    """Check splits for duplicate rows, within and across splits.
+
+    Two identities are checked per split: the canonicalized ``row_index`` and a
+    content hash of ``text_state``. Any overlap *between* splits is reported as
+    a failure with example keys, because a row shared by train and test makes
+    every held-out metric meaningless. Returns the report dict with
+    ``passed`` set accordingly.
+    """
+    per_split: dict[str, dict[str, Any]] = {}
+    index_sets: dict[str, set[str]] = {}
+    hash_sets: dict[str, set[str]] = {}
+    for name, paths in splits.items():
+        if not paths:
+            raise ValueError(f"no parquet shards found for split {name!r}")
+        rows = blank_key = blank_state = 0
+        keys: set[str] = set()
+        digests: set[str] = set()
+        for path in paths:
+            r, k, h, bk, bs = _split_keys(path)
+            rows += r
+            keys |= k
+            digests |= h
+            blank_key += bk
+            blank_state += bs
+        index_sets[name] = keys
+        hash_sets[name] = digests
+        per_split[name] = {
+            "shards": [str(path) for path in paths],
+            "rows": rows,
+            "unique_row_index": len(keys),
+            "unique_state": len(digests),
+            "duplicate_row_index": rows - blank_key - len(keys),
+            "duplicate_state": rows - blank_state - len(digests),
+            "blank_row_index": blank_key,
+            "blank_state": blank_state,
+        }
+
+    names = list(splits)
+    overlaps: dict[str, dict[str, Any]] = {}
+    passed = True
+    for position, left in enumerate(names):
+        for right in names[position + 1:]:
+            shared_keys = sorted(index_sets[left] & index_sets[right])
+            shared_hashes = sorted(hash_sets[left] & hash_sets[right])
+            if shared_keys or shared_hashes:
+                passed = False
+            overlaps[f"{left}|{right}"] = {
+                "row_index": len(shared_keys),
+                "state": len(shared_hashes),
+                "row_index_examples": shared_keys[:5],
+                "state_examples": shared_hashes[:5],
+            }
+    return {
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "splits": per_split,
+        "overlaps": overlaps,
+        "passed": passed,
+    }
 
 
 # --------------------------------------------------------------------- splitting

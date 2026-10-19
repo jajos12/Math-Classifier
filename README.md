@@ -25,16 +25,16 @@ selection. These are tactic-ranking metrics, not proof-execution success.
 ```text
 Math-Classifier/
 ├── config.py          settings and artifact paths
-├── data.py            Hugging Face dataset download and sampling
+├── data.py            dataset download, sampling, split carving, audits
 ├── graph.py           Lean parser, DAG, and PyG conversion
 ├── gnn.py             model download and public inference API
 ├── gnn_bundle.py      published GATv2 checkpoint backend
 ├── laya_interface.py  public Laya adapter exports
 ├── laya_adapter.py    local Laya loading, translation, and reranking
 ├── evaluation.py      metrics and JSON reports
-├── comparison.py      pool cache, multi-checkpoint comparison, run history
+├── comparison.py      pool cache, multi-checkpoint comparison, acceptance, run history
 ├── progress.py        progress bars, heartbeats, and stage banners
-├── pipeline.py        dataset split, benchmark and validation CLI
+├── pipeline.py        download/audit/pools/split/benchmark CLI
 ├── laya_retrain.py    translated training-record preparation and CLI
 ├── laya_trainer.py    built-in laya.train.finetune adapter
 ├── tactic_choose.py   tactic candidate catalog and name validation
@@ -291,8 +291,12 @@ disabled, reranks a cached GNN pool with both the base and the new checkpoint
 so the two can be compared directly.
 
 Every prepared record presents Laya with the same 10-way decision it faces at
-inference: the row's gold tactic plus 9 unique distractors drawn at random
-from the most common tactic families. This is described in
+inference: the row's **own GNN top-10 ranking** (names and scores from
+`pipeline.py pools`) as the option list, and a **soft label** that blends the
+GNN's score distribution with the gold tactic
+(`λ·p_gnn + (1−λ)·onehot(gold)`, `--gnn-lambda`, default 0.3). Rows whose gold
+tactic sits outside the GNN top-10 are skipped, never taught a disagreeing
+target. This is described in
 [How the 10 options are chosen](#how-the-10-options-are-chosen).
 
 The CLI prints stage banners (`pre-flight`, `stage 1/3 translating records`,
@@ -302,21 +306,26 @@ times, so a long run always shows where it is.
 ### 1. Download the training data
 
 The repository intentionally does not contain the Hugging Face dataset. From
-the repository root, download the `train` parquet shards:
+the repository root, download the `train` and `val` splits and combine their
+shards in one command each:
+
+```bash
+python3 pipeline.py fetch --split train --out data/train.parquet
+python3 pipeline.py fetch --split val   --out data/val.parquet
+```
+
+`fetch` downloads the parquet shards and concatenates them into the given
+file (default `data/<split>.parquet`); add `--no-combine` to keep the raw
+shards, or combine them yourself:
 
 ```bash
 python3 - <<'PY'
 from pathlib import Path
-from data import download_dataset
+from data import combine_shards
 
-paths = download_dataset(
-    "jajostrains/Mathlib-Normalized-Sexpr",
-    "train",
-    Path("data/Mathlib-Normalized-Sexpr"),
-)
-
-for path in paths:
-    print(path)
+paths = sorted(Path("data/Mathlib-Normalized-Sexpr").rglob("train/*.parquet"))
+output, rows = combine_shards(paths, Path("data/train.parquet"))
+print(f"Wrote {rows} rows to {output}")
 PY
 ```
 
@@ -328,67 +337,97 @@ export HF_TOKEN="your-hugging-face-token"
 
 Do not commit the token. The dataset is ignored by `.gitignore`.
 
-### 2. Create one parquet input file
+### 2. Check the splits for duplicate rows
 
-`laya_retrain.py` accepts parquet, JSONL, JSON, or CSV. If the download
-produced multiple parquet shards, combine them into the path used below:
+Training and evaluation are only meaningful if the native
+`train` / `val` / `test` splits share no rows. The audit streams all three
+split files, hashes each row by `row_index` **and** by proof-state content,
+and fails loudly on any overlap:
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-import pandas as pd
-
-paths = sorted(Path("data/Mathlib-Normalized-Sexpr").rglob("*.parquet"))
-if not paths:
-    raise SystemExit("No parquet shards found.")
-
-frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
-output = Path("data/train.parquet")
-output.parent.mkdir(parents=True, exist_ok=True)
-frame.to_parquet(output, index=False)
-
-print(f"Wrote {len(frame)} rows to {output}")
-print("Columns:", ", ".join(frame.columns))
-PY
+python3 pipeline.py audit
 ```
 
-The input must contain at least:
+```text
+audit: jajostrains/Mathlib-Normalized-Sexpr splits train, val, test
+  train  218,727 rows — 218,727 unique row_index, ... unique states, within-split dupes 0 (index) / 0 (state)
+  val      4,157 rows — ...
+  test     4,392 rows — ...
+  train vs val: ok — 0 shared row_index, 0 shared states
+  train vs test: ok — 0 shared row_index, 0 shared states
+  val vs test: ok — 0 shared row_index, 0 shared states
+report: outputs/audit.json
+audit passed: no cross-split duplicate rows
+```
+
+The exit code is non-zero and `outputs/audit.json` records `passed: false`
+(with example keys) when splits overlap. `laya_retrain.py` reads that file in
+pre-flight and refuses to run without it (`--skip-audit` opts out, with a
+warning that the numbers may be contaminated). Re-run the audit after any
+change to the dataset files.
+
+### 3. Build the per-row GNN pools
+
+Options and soft labels come from the GNN's own rankings, so score each split
+once and store its top-10 ranking and scores per row:
+
+```bash
+# resumable; --limit N scores only the first N rows as a smoke test
+python3 pipeline.py pools --split train --out data/train-pools.jsonl --device cuda:0
+python3 pipeline.py pools --split val   --out data/val-pools.jsonl   --device cuda:0
+```
+
+Each JSONL line is
+`{"row_index": ..., "target": ..., "ranking": [...], "scores": [...]}` —
+the ranking and its score vector are exactly what training will present and
+blend (see [How the 10 options are chosen](#how-the-10-options-are-chosen)).
+
+### 4. Create one parquet input file
+
+`pipeline.py fetch --out` already produced `data/train.parquet` and
+`data/val.parquet`. `laya_retrain.py` accepts parquet, JSONL, JSON, or CSV,
+so point it at whichever file you prefer. The input must contain at least:
 
 ```text
 text_state
 tactic
 ```
 
-A `row_index` column is optional but recommended: it keys the per-row
-distractor draw (making records reproducible and letting the eval-overlap
-guard and the `--row-pools` hard-negative pools match rows cheaply). Without
-it, a stable hash of the proof state is used instead. If the dataset already
-exists elsewhere, use its actual path instead of `data/train.parquet`; the
-file is not created by cloning the repo.
+A `row_index` column is required in practice: it keys the per-row option
+shuffle and matches rows to their `--row-pools` entry (canonicalized, so
+`123`, `123.0`, and `" 123 "` are the same key). Without it, a stable hash of
+the proof state is used instead — but the pools file would then never match,
+so supply `row_index`. If the dataset already exists elsewhere, use its
+actual path instead of `data/train.parquet`; the file is not created by
+cloning the repo.
 
-### 3. Prepare and preview the Laya records
+### 5. Prepare and preview the Laya records
 
 Run this from the repository root. Preparation does not train the model and
 does not require a GPU; it converts each parquet row into one JSONL choice
-record with a 10-option decision:
+record whose options are the row's own GNN ranking and whose target is the
+soft label:
 
 ```bash
 python3 laya_retrain.py \
     data/train.parquet \
     outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl \
     --preview
 ```
 
-The command writes `outputs/laya_train.jsonl` and prints the first record.
-Inspect the preview before processing the complete dataset. Preparation first
-computes the distractor pool and prints it, so you can see the common tactics
-it will draw from:
+`--row-pools` is **required**: there is no fallback option source. The command
+writes `outputs/laya_train.jsonl` and prints the first record. Inspect the
+preview before processing the complete dataset. Pre-flight first verifies the
+audit, then shows what it will train on:
 
 ```text
 === pre-flight checks [+0s] ===
-  distractor pool: 20 common tactics from data/train.parquet
-                 : rw, simp, exact, intro, apply, aesop, ...
-  options/record : gold + 9 unique distractors (seed 42, random gold position, reshuffled every epoch)
+  audit         : outputs/audit.json passed — no duplicate rows across train/val/test
+  row pools     : 218,727 per-row GNN pools from data/train-pools.jsonl
+                 : options and scores come from each row's own ranking; rows without a pool are skipped (pool_missing)
+  options/record: up to 10 names from the row's ranking (seed 42, shuffled per row, reshuffled every epoch)
+  soft target   : 0.30·GNN + 0.70·gold → gold.tactic.probabilities (gnn-blend-v1)
 ```
 
 Preparation reads parquet in chunks and writes JSONL row by row, so a
@@ -402,29 +441,37 @@ counted instead of aborting the run:
 | `state_invalid` | the state could not be parsed into a proof state |
 | `tactic_missing` / `tactic_empty` | `tactic` is null or has no usable tactic name |
 | `tactic_unknown` | the tactic family is not in `tactic_choose.py` |
+| `pool_missing` | the row has no entry in `--row-pools` (split/key mismatch) |
+| `gold_not_in_pool` | the gold tactic is outside the row's GNN top-10 |
+| `short_pool` | the row's ranking holds fewer than 2 usable options |
+| `bad_target` | the row's GNN scores cannot be blended into a target |
 
-Pass `--strict` to stop at the first such row instead (row numbers are
-1-based). The summary and the sidecar report every count:
+`gold_not_in_pool` is expected for roughly the `1 − GNN recall@10` share of
+rows (the benchmark's retrieval ceiling): teaching such a row would disagree
+with how the benchmark scores it, so it is skipped and counted. Pass
+`--strict` to stop at the first skipped row instead (row numbers are 1-based).
+The summary and the sidecar report every count:
 
 ```text
 outputs/laya_train.stats.json
 ```
 
 That file records rows read, records written, skipped rows by reason with one
-example each, the histogram of options per row (always `10` unless the pool is
-small), how many rows had their gold tactic inside the common pool versus
-inserted from outside it, and the distractor pool itself. It is read again
-after training and copied into `outputs/comparison.json`.
+example each, the histogram of options per row (10 unless a GNN ranking is
+shorter), `gnn_lambda`, `target_source`, and the mean soft-target gold mass,
+and the pools file used. It is read again after training and copied into
+`outputs/comparison.json`.
 
 Useful flags for the first run:
 
 ```bash
 # translate only the first 5000 rows (fast smoke run)
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl --limit 5000
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl --limit 5000
 
 # or a reproducible random sample of 5000 rows
 python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
-    --sample 5000 --seed 42
+    --row-pools data/train-pools.jsonl --sample 5000 --seed 42
 ```
 
 `--quiet` hides the bar, `--preview` prints the first record after it is
@@ -438,15 +485,17 @@ Each record contains:
 - `raw_state`: the original Lean proof state.
 - `state`: a structured description with `CURRENT GOAL`, `LOCAL HYPOTHESES`,
   and a `TASK` section.
-- `questions.tactic.instructions`: the shared proof-state reasoning prompt.
-- `questions.tactic.criteria`: a description of each of the 10 candidate
-  tactics, keyed by tactic name.
-- `expected.application`: the original tactic application, such as `rw [h]`.
-- `expected.tactic`: the normalized tactic family, such as `rw`.
-- `metadata`: the 10-option order, the option count, whether the gold tactic
-  was in the offered pool (the row's own GNN ranking under `--row-pools`,
-  otherwise the common pool), the prompt version, and — when `--row-pools`
-  is configured — whether this row matched a per-row pool.
+- `questions.tactic.instructions`: the shared prompt (a multiple-choice
+  question; answer with a probability per option).
+- `questions.tactic.criteria`: a description of each candidate tactic, keyed
+  by tactic name.
+- `gold.tactic.probabilities`: the **soft training target** —
+  `λ·p_gnn + (1−λ)·onehot(gold)` over this row's options.
+- `expected.application` / `expected.tactic`: the original tactic application
+  (`rw [h]`) and normalized family (`rw`), used for evaluation.
+- `metadata`: the shuffled option order, the option count, `gold_in_pool`,
+  `target_source`, `distill_lambda`, `target_gold_mass`, the prompt version,
+  and whether the row matched its pool.
 
 The translated state preserves Lean identifiers and expressions while expanding
 common logical symbols into readable phrases. This gives Laya both exact names
@@ -454,128 +503,100 @@ and a clearer description of how the goal relates to the local hypotheses.
 
 ### How the 10 options are chosen
 
-Training and inference must present the same *shape* of decision, so the
-record builder constructs every pool the way the benchmark does at inference
-time — a 10-option rerank over plausible tactics:
+Training and inference must present the same *shape* of decision, so a record's
+option list **is** the row's GNN ranking — the same top-10 pool the benchmark
+reranks at inference:
 
-1. **The pool is the 20 most common tactics.** One projected single-column
-   pass over the whole corpus ranks tactic families by frequency
-   (normalized to families, ties broken alphabetically). This is the
-   `distractor pool` printed in pre-flight and stored in the stats sidecar.
-2. **9 distractors are drawn at random, without replacement,** from that pool
-   for each row. Uniformly — frequency only selects the pool, it does not
-   weight the draw, so a common distractor is not more likely to appear than
-   an uncommon one within the pool.
-3. **The gold tactic is always included, exactly once.** It is usually one of
-   the common tactics already; when a row's gold tactic is *not* in the
-   top-20 it is inserted anyway, and the row is counted in
-   `gold_inserted` in the stats sidecar.
-4. **The gold tactic sits at a uniformly random index.** It is shuffled in
-   with the distractors, so it is equally likely to appear in any of the 10
-   slots.
+1. **The pool is the row's own GNN top-k ranking**, stored by
+   `pipeline.py pools` (names normalized to canonical tactic families,
+   duplicates collapsed, unknown names dropped). Nothing else ever supplies
+   options: there is no common-tactic fallback and no distractor top-up.
+2. **The gold tactic must already be inside.** If it is not (about
+   `1 − GNN recall@10` of rows — the retrieval ceiling), the row is skipped as
+   `gold_not_in_pool` and counted, because training it would teach a target
+   the benchmark's own scoring contradicts. Gold is never inserted.
+3. **A ranking shorter than 10 keeps its natural length.** Short pools are
+   recorded (`short_pool` in metadata and the option histogram in the stats
+   sidecar), never padded, so training always matches what inference reranks.
+4. **Options are shuffled per row** with an RNG keyed on `(seed, row_index)`,
+   so position carries no signal, the draws are identical across runs and
+   `--limit`/`--sample` subsets, and a second file translated with the same
+   pools file reproduces the same choices. Laya additionally reshuffles the
+   options every epoch (`shuffle_options`).
 
-Because nothing about the option set or the gold position depends on the row's
-*position in the file*, the draws are stable across runs, unaffected by
-`--limit`/`--sample`, and reproducible when a second file is translated with
-the same pool (`--distractor-pool`, below).
+#### The soft training label (`--gnn-lambda`)
 
-#### Hard negatives: per-row GNN pools (`--row-pools`)
+The gold tactic marks *what is right*; the GNN's scores say *how confident the
+retriever was*. The training target keeps both:
 
-Random common-tactic distractors are *easy* — almost none of them could
-plausibly solve the state, so a model trained on them learns a coarse
-plausibility filter that does not transfer to the benchmark, where all 10
-candidates come from the GNN's top-10 and are all plausible. `--row-pools
-PATH` closes that gap by letting each row draw its 9 distractors from **its
-own GNN ranking**:
-
-```bash
-# once per split: score the whole train split and write per-row top-k pools
-# (resumes if interrupted; --limit N scores only the first N rows as a smoke test)
-python3 pipeline.py pools --split train --out data/train-pools.jsonl --device cuda:0
-
-# translation draws each row's distractors from its own ranking
-python3 laya_retrain.py data/train_fit.parquet outputs/laya_train.jsonl \
-    --row-pools data/train-pools.jsonl --fine-tune --device cuda:1 ...
+```text
+gold.tactic.probabilities = λ · p_gnn + (1 − λ) · onehot(gold)
 ```
 
-- The file is JSONL, one row per line:
-  `{"row_index": ..., "target": ..., "ranking": [...], "scores": [...]}`.
-- When the gold tactic is inside the row's ranking, the distractors are
-  exactly the other 9 candidates; when it is outside (the benchmark's
-  recall@k ceiling, ~14% of test rows), gold is inserted anyway and the row
-  is counted in `gold_inserted`, as in the default mode.
-- Gold position stays uniformly random, options stay unique, and the trainer
-  still reshuffles every epoch — hard negatives change *which* tactics
-  compete, never how the answer is marked.
-- Rows without a pool (or a ranking shorter than 10) fall back to the
-  common-tactic draw, and the fallback count is reported. Pre-flight also
-  prints how many sampled rows matched, so a `row_index` keying mismatch is
-  visible before training starts.
-- Translate the validation half with the **same** `--row-pools` file, so the
-  held-out metric measures exactly the skill the benchmark measures.
+- `p_gnn` is the row's GNN score vector normalized over its options (uniform
+  when the scores sum to zero; negative or non-finite scores are a
+  `bad_target` skip).
+- `λ` is `--gnn-lambda` (default **0.3**), so the default target puts 70%
+  mass on the gold tactic and 30% on the GNN's distribution — the mean gold
+  mass actually written is reported as `mean_gold_mass` in the stats sidecar.
+- `λ=0` recovers a hard one-hot label; `λ=1` trains on the pure GNN
+  distribution. The blend always sums to 1.
 
-**Nothing else varies.** Every candidate — gold or distractor — gets the same
-kind of description and the same state-dependent hints, drawn only from the
-proof state. Combined with the random gold position above and the per-epoch
-reshuffle inside Laya (the trainer sets `shuffle_options=("choice",)`), this
-means the *only* learnable signal is the proof state itself:
+Laya's trainer consumes this directly: with the default `loss="rlcd"` the
+soft probabilities act as the cross-entropy target alongside the GRPO term
+(`target_from_gold` in `laya.train` renormalizes and validates them), so no
+fork of Laya is needed. The prompt matches the framing: Laya answers the
+multiple-choice question with a probability for every option that sums to 1 —
+"these numbers express how confident you are in the right answer, not how
+useful you find an option" — which is exactly what a soft label teaches.
 
-- A candidate's **position** carries no information (random per row, reshuffled
-  every epoch).
-- A candidate's **presence** is drawn from a common-tactic pool, so "the gold is
-  always in the list" is not a shortcut — but neither is any distractor more
-  positionally or descriptively privileged than the gold.
-- The **set of distractors** for a given gold tactic is redrawn per row, so the
-  model cannot memorize a fixed "rw competes against {simp, exact, ...}" list.
+Because the options, the shuffle, and the target all derive from the pools
+file, translating a second file (validation) with the **same** pools file and
+`--gnn-lambda` presents Laya with an identical distribution.
 
-### 4. Prepare validation data
+### 6. Prepare validation data
 
 `--fine-tune --eval-data <path>` fails immediately if that file is missing, and
 Laya only reports *overlap* with the training data after it has read and
 encoded the whole training set. Prepare the validation JSONL first — it is
 cheap to check and expensive to discover late.
 
-Use a separate validation parquet file. Do not use the final assessment/test
-file to choose training settings or a checkpoint. If you have no separate
-validation split, carve one out of `data/train.parquet` before fine-tuning:
+Use the dataset's **native `val` split**, never the `test` split, to choose
+training settings or a checkpoint (the audit in step 2 already proved the
+three splits are disjoint):
 
 ```bash
-python3 pipeline.py split data/train.parquet
+python3 pipeline.py fetch --split val --out data/val.parquet
+python3 pipeline.py pools --split val --out data/val-pools.jsonl --device cuda:0
+python3 laya_retrain.py \
+    data/val.parquet \
+    outputs/laya_validation.jsonl \
+    --row-pools data/val-pools.jsonl
 ```
 
-This writes `data/train_fit.parquet` (80% of the rows) and
-`data/validation.parquet` (20%) from a seeded assignment: the two files share
-no rows, and the split is reproducible (`--validation-fraction` and `--seed`
-change it). Fine-tuning then trains on `data/train_fit.parquet`. The
+Each side needs its own pools file (`pipeline.py pools --split ...` scores
+that split's rows), and both sides must use the same `--gnn-lambda`, so the
+held-out metric measures exactly the skill the benchmark measures. The
 pre-flight of every fine-tune run intersects `--eval-data` with the training
 dataset — matched on `row_index`, falling back to the raw proof state — and
 refuses to start when they overlap, because an evaluation over its own
 training rows measures memorization. `--allow-eval-overlap` opts out.
 
-Translate the validation half, pointing `--distractor-pool` at the *training*
-file so both halves present Laya with the identical pool:
-
-```bash
-python3 laya_retrain.py \
-    data/validation.parquet \
-    outputs/laya_validation.jsonl \
-    --distractor-pool data/train_fit.parquet
-```
-
-When fine-tuning with `--row-pools`, pass the same pools file here as well
-(`data/train-pools.jsonl` covers the whole train split, so the validation rows
-have entries too); `--distractor-pool` stays as the fallback for rows without
-a pool, and the stats sidecar reports how many rows matched.
-
 `outputs/laya_validation.jsonl` is only the Laya eval file — the benchmark
 test split used by the post-training comparison is a different, untouched
 split.
 
-### 5. Run fine-tuning on the GPU server
+The old carve command (`python3 pipeline.py split data/train.parquet`) still
+exists for datasets without a native validation split; it writes a disjoint
+`data/train_fit.parquet` / `data/validation.parquet` pair from a seeded
+assignment. With the native splits in place it is not needed.
+
+### 7. Run fine-tuning on the GPU server
 
 The repository includes a trainer adapter backed by Laya's public
-`laya.train.finetune` API. It trains the choice head and encoder, fits
-calibration temperatures, and writes a checkpoint that can be loaded with
+`laya.train.finetune` API. It trains the choice head and encoder with the
+`rlcd` loss (GRPO term + soft cross-entropy against `gold.tactic.probabilities`),
+fits calibration temperatures, and writes a checkpoint that can be loaded with
 `laya.load`. The adapter requires Laya 0.3.28 or newer:
 
 ```bash
@@ -587,8 +608,9 @@ first run should be small:
 
 ```bash
 python3 laya_retrain.py \
-    data/train_fit.parquet \
+    data/train.parquet \
     outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl \
     --device cuda:1 \
     --limit 5000 \
     --fine-tune \
@@ -606,8 +628,9 @@ Drop `--dry-run`, raise `--limit` (or remove it for the full dataset), and set
 
 ```bash
 python3 laya_retrain.py \
-    data/train_fit.parquet \
+    data/train.parquet \
     outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl \
     --device cuda:1 \
     --fine-tune \
     --checkpoint-dir outputs/laya-checkpoint \
@@ -615,19 +638,22 @@ python3 laya_retrain.py \
     --epochs 4
 ```
 
-The base checkpoint (`convaiinnovations/laya`), the RLCD loss, the batch shape
+The base checkpoint (`convaiinnovations/laya`), the RLCD loss, the soft-label
+blend (`--gnn-lambda 0.3`, the default), the batch shape
 (`--micro-batch 8` × `--grad-accum 8`), and the per-epoch option reshuffle are
 fixed experiment defaults; the flags to reach for are `--micro-batch` /
-`--grad-accum` when the GPU memory budget demands it and `--model-dir` when
-fine-tuning from a different base checkpoint.
+`--grad-accum` when the GPU memory budget demands it, `--gnn-lambda` when
+sweeping the label blend, and `--model-dir` when fine-tuning from a different
+base checkpoint.
 
 Before training starts the command validates the inputs and prints what it is
-about to do: dataset row count and expected JSONL size, `--eval-data`
-existence, schema, and whether its rows are disjoint from the training
-dataset, the optimizer budget (micro-batches per epoch, effective batch,
-total updates), and whether the requested `cuda:N` is actually visible. A
-missing validation file, an overlapping eval split, or an out-of-range GPU
-index fails here, in seconds, instead of after an hour of preprocessing.
+about to do: the audit result, the pools file and soft-label blend, dataset
+row count and expected JSONL size, `--eval-data` existence, schema, and
+whether its rows are disjoint from the training dataset, the optimizer budget
+(micro-batches per epoch, effective batch, total updates), and whether the
+requested `cuda:N` is actually visible. A missing validation file, an
+overlapping eval split, a missing/failed audit, or an out-of-range GPU index
+fails here, in seconds, instead of after an hour of preprocessing.
 
 `--fine-tune` prepares `outputs/laya_train.jsonl` and passes that file
 directly to `laya.train.finetune` (there is no second copy). During training:
@@ -690,16 +716,29 @@ system           recall@10  recall@5   recall@1    mrr@10
 GNN                   0.900     0.750     0.250     0.420
 base                  0.350     0.250     0.050     0.140
 finetuned             0.520     0.410     0.130     0.240
+
+acceptance (500 rows): FAIL
+  FAIL finetuned.recall@5 > gnn.recall@5 (0.410 vs 0.750)
+  FAIL finetuned.mrr@10 > gnn.mrr@10 (0.240 vs 0.420)
+  ok   finetuned.recall@1 > base.recall@1 (0.130 vs 0.050)
 ====================================================================
 ```
 
 and writes:
 
 ```text
-outputs/comparison.json   full metrics per checkpoint, option counts, environment
-outputs/comparison.png    recall chart plus confidence/fallback notes
-outputs/history.jsonl     one appended line for this run
+outputs/comparison.json   full metrics per checkpoint, option counts, acceptance gates, environment
+outputs/comparison.png    recall chart plus confidence/fallback and acceptance notes
+outputs/history.jsonl     one appended line for this run (including the verdict)
 ```
+
+The **acceptance verdict** is computed from the same table: the fine-tune is
+accepted only when it beats the GNN itself on `recall@5` *and* `mrr@10`, and
+beats the base Laya checkpoint on `recall@1`. Each gate records both values,
+so a FAIL line is self-explanatory. The intended measurement point is
+`--compare-rows 500` (the default `100` is enough for a smoke check but too
+small for the verdict); `passed` / `gates` live under `acceptance` in
+`outputs/comparison.json` and `outputs/history.jsonl`.
 
 Use `--compare-rows 0` to skip the comparison. It deliberately uses the
 benchmark's untouched test split with a fixed seed, not the training or
@@ -711,13 +750,12 @@ recorded in the same place.
 
 ### Known measurement caveats
 
-- **Pool vs. system recall.** The 10-option training pools are *constructed*,
-  so pool recall over them is 100% by design — the gold tactic is always one
-  of the 10. That number says nothing about the deployed system, which ranks
-  the **GNN's** top-10 pool. The end-to-end ceiling is roughly
-  `GNN recall@10` (about 0.95 on the test split) times Laya's *conditional*
-  rerank accuracy on those 10. Read the conditional columns in
-  `outputs/comparison.json` and `history.jsonl`; do not read the constructed
+- **Pool vs. system recall.** Training only sees rows whose gold tactic is
+  *inside* the GNN top-10 (the rest are `gold_not_in_pool` skips), so training
+  rows are easier than the full benchmark population. The end-to-end ceiling
+  remains `GNN recall@10` (about 0.91 on the test split) times Laya's
+  *conditional* rerank accuracy on those 10. Read the conditional columns in
+  `outputs/comparison.json` and `history.jsonl`; never read a constructed
   pool's recall@10 as a system metric.
 - **Calibration warning.** Loading Laya prints a
   `RuntimeWarning: ... uncalibrated` line about probability adjustment. It
@@ -731,7 +769,7 @@ recorded in the same place.
   records `laya_device.requested` / `laya_device.actual` so a slow or
   surprising run is attributable.
 
-### 6. Record and export the run
+### 8. Record and export the run
 
 Keep the checkpoint, prepared data, report, and environment record together
 for the separate assessment server:
@@ -751,18 +789,21 @@ for the separate assessment server:
 The important files are:
 
 ```text
-data/train_fit.parquet                 training part of `pipeline.py split`
-data/validation.parquet                held-out part of the same split
-outputs/laya_train.jsonl              prepared training records
-outputs/laya_train.stats.json         rows written, skipped, option counts
-outputs/laya_validation.jsonl         held-out records for --eval-data
-outputs/laya-checkpoint/              fine-tuned model
+outputs/audit.json                          cross-split duplicate audit (required)
+data/train.parquet                          full train split (native split)
+data/val.parquet                            native validation split
+data/train-pools.jsonl                      per-row GNN rankings + scores (train)
+data/val-pools.jsonl                        per-row GNN rankings + scores (val)
+outputs/laya_train.jsonl                    prepared training records
+outputs/laya_train.stats.json               rows written, skipped, blend, option counts
+outputs/laya_validation.jsonl               held-out records for --eval-data
+outputs/laya-checkpoint/                    fine-tuned model
 outputs/laya-checkpoint/training_report.json
 outputs/laya-checkpoint/run_environment.txt
-outputs/comparison.json               base vs fine-tuned metrics
+outputs/comparison.json                     base vs fine-tuned metrics + acceptance
 outputs/comparison.png
-outputs/history.jsonl                 every benchmark/comparison run
-outputs/environment.json              interpreter, packages, CUDA, git state
+outputs/history.jsonl                       every benchmark/comparison run
+outputs/environment.json                    interpreter, packages, CUDA, git state
 ```
 
 Copy this frozen checkpoint to the assessment server. Do not retrain or change
@@ -771,13 +812,19 @@ evaluation.
 
 ### Prompt and candidate descriptions
 
-Inference and retraining use the same prompt and tactic-description catalog.
-The prompt asks Laya to analyze the current goal together with local
-hypotheses and identify the proof action that best advances that state.
-Descriptions explain operations such as rewriting, applying a hypothesis,
-simplifying, destructuring, introducing variables, or solving arithmetic. The
-prompt lives in `DEFAULT_INSTRUCTIONS` (`laya_adapter.py`); edit it there to
-test a different one.
+Inference and retraining use the same prompt and tactic-description catalog
+(one source of truth: `DEFAULT_INSTRUCTIONS` in `laya_adapter.py`, imported
+by both the trainer and `config.py`). The prompt frames the task as what it
+is — **a multiple-choice question over the candidate tactics**: read the goal
+and the local hypotheses, eliminate options that cannot apply or make no
+progress, keep the ones that advance the goal as written, and answer with a
+probability per candidate that sums to 1: "these numbers express how confident
+you are in the right answer, not how useful you find an option." Descriptions
+explain operations such as rewriting, applying a hypothesis, simplifying,
+destructuring, introducing variables, or solving arithmetic. Edit
+`DEFAULT_INSTRUCTIONS` to test a different prompt; prepared records stamp it
+with `metadata.prompt_version` (`lean-tactic-family-v4-softlabel`) so runs
+remain attributable.
 
 ## Testing a run end-to-end
 
@@ -795,26 +842,49 @@ python pipeline.py devices
 
 `validate` proves the parser/graph path works without Torch, PyG, or Laya.
 
-**1. Preparation smoke run (seconds)**
+**1. Audit the splits (seconds–minutes, no GPU)**
+
+```bash
+python3 pipeline.py audit
+python3 pipeline.py fetch --split val --out data/val.parquet
+```
+
+`audit` must print `audit passed` and write `outputs/audit.json`; every later
+`laya_retrain.py` run reads it. A failure means the native splits share rows
+and the numbers would be contaminated — fix the dataset before continuing.
+
+**2. Pools (minutes on a GPU, resumable)**
+
+```bash
+python3 pipeline.py pools --split train --out data/train-pools.jsonl --limit 2000
+```
+
+Confirm the JSONL lines carry `row_index`, `ranking`, and `scores`. Score the
+full splits (`--limit` is only the smoke test) before the real preparation.
+
+**3. Preparation smoke run (seconds)**
 
 ```bash
 python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
-    --limit 5000 --preview
+    --row-pools data/train-pools.jsonl --limit 5000 --preview
 ```
 
-Check four things in the output: the distractor pool pre-flight line, the
-`sample` line (how many of the first 200 rows were usable), the skipped-row
-summary (each reason and count), and the printed record (`expected.tactic`
-should be the tactic you expect, and `metadata.candidate_order` should list
-exactly 10 options with the gold tactic among them).
+Check four things in the output: the `audit` and `soft target` pre-flight
+lines, the `sample` line (how many of the first 200 rows were usable, and
+which reasons were skipped), the skipped-row summary (each reason and count),
+and the printed record (`expected.tactic` should be the tactic you expect,
+`gold.tactic.probabilities` should sum to 1 with the gold carrying roughly
+`0.7 + 0.3·p_gnn`, and `metadata.candidate_order` should list the row's own
+GNN ranking options).
 
-**2. Dry run over the whole dataset (minutes, no GPU)**
+**4. Dry run over the whole dataset (minutes, no GPU)**
 
 Remove `--limit`, add `--dry-run`, and let it report the item counts and the
 optimizer budget:
 
 ```bash
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl --dry-run
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl --dry-run
 ```
 
 For 218,727 rows the JSONL is about 1 GB (roughly 4.5 KB per record), so the
@@ -823,56 +893,63 @@ that file back into memory. Budget several GB of RAM for the training step
 and expect the first progress output only after Laya has read and encoded the
 file — that quiet window is what the heartbeat reports on.
 
-**3. Validation split (seconds)**
+**5. Validation split (seconds)**
 
 ```bash
-python3 pipeline.py split data/train.parquet
-python3 laya_retrain.py data/validation.parquet outputs/laya_validation.jsonl \
-    --distractor-pool data/train_fit.parquet
+python3 pipeline.py pools --split val --out data/val-pools.jsonl
+python3 laya_retrain.py data/val.parquet outputs/laya_validation.jsonl \
+    --row-pools data/val-pools.jsonl
 ```
 
-Steps 4 and 5 must train on `data/train_fit.parquet`, never on the full
-`data/train.parquet`: the pre-flight rejects an `--eval-data` file whose rows
-are also in the training dataset, which is exactly the mistake this split
-prevents. `--distractor-pool data/train_fit.parquet` makes the validation
-records use the training file's common-tactic pool, so training and eval
-present Laya with the same option distribution. Check that the translated
-validation file exists and has content — preparing it after training has
-started is the classic way to lose an hour.
+The native `val` split shares no rows with `train` (the audit proved it), and
+its own pools file gives it the same option shape as training. Check that the
+translated validation file exists and has content — preparing it after
+training has started is the classic way to lose an hour.
 
-**4. Fine-tune smoke run (minutes on a GPU)**
+**6. Fine-tune smoke run (minutes on a GPU)**
 
 ```bash
-python3 laya_retrain.py data/train_fit.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl \
     --device cuda:1 --limit 5000 \
     --fine-tune --checkpoint-dir outputs/laya-checkpoint-smoke \
     --eval-data outputs/laya_validation.jsonl --epochs 1
 ```
 
-Confirm the pre-flight prints `eval overlap  : none`, the stage banners appear,
-the heartbeat or progress bar starts, a checkpoint directory is written with
-`training_report.json`, and the final comparison table prints. Delete the
-smoke checkpoint afterwards.
+Confirm the pre-flight prints `audit ... passed` and
+`eval overlap  : none`, the stage banners appear, the heartbeat or progress
+bar starts, a checkpoint directory is written with `training_report.json`,
+and the final comparison table (with its acceptance verdict) prints. Delete
+the smoke checkpoint afterwards.
 
-**5. Full run**
+**7. Full run**
 
-Repeat step 4 without `--limit` and with `--epochs 4`, then re-run the
-benchmark against the new checkpoint:
+Repeat step 6 without `--limit` and with `--epochs 4`, then let the automatic
+comparison judge the run at the intended measurement size:
 
 ```bash
-python pipeline.py benchmark --rows 100 --device cuda:1 \
+python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+    --row-pools data/train-pools.jsonl \
+    --device cuda:1 \
+    --fine-tune --checkpoint-dir outputs/laya-checkpoint \
+    --eval-data outputs/laya_validation.jsonl \
+    --epochs 4 --compare-rows 500
+```
+
+The `acceptance` block in `outputs/comparison.json` is the verdict: all three
+gates must pass (beat the GNN on `recall@5` and `mrr@10`, beat base Laya on
+`recall@1`). Compare with the base-checkpoint benchmark already stored in
+`outputs/history.jsonl`, and re-run the benchmark against the new checkpoint
+if you also want the standalone measurement:
+
+```bash
+python pipeline.py benchmark --rows 500 --device cuda:1 \
     --laya-model outputs/laya-checkpoint
 ```
 
-Compare it with the base-checkpoint benchmark already stored in
-`outputs/history.jsonl`. Two runs that differ by more than a few points on
-`--rows 100` are usually noise; the automatic comparison in
-`outputs/comparison.json` is the paired measurement to trust, because it
-holds the pool fixed.
-
 If anything fails, `python pipeline.py validate` plus the pre-flight output
-from `laya_retrain.py` localize most problems (columns, tactics, GPU
-visibility, missing eval file) without touching the GPU.
+from `laya_retrain.py` localize most problems (columns, tactics, pools keys,
+audit, GPU visibility, missing eval file) without touching the GPU.
 
 ## Important implementation details
 
@@ -887,21 +964,24 @@ visibility, missing eval file) without touching the GPU.
   to `outputs/laya_train.stats.json`.
 - Fine-tuning refuses an `--eval-data` file whose rows are also in the
   training dataset (matched on `row_index`, falling back to the raw proof
-  state). `pipeline.py split` carves the disjoint pair, and
-  `--allow-eval-overlap` overrides the check when the overlap is intended.
-- Every training record is a 10-way decision: the gold tactic plus 9 unique
-  distractors. By default they are drawn from the corpus's 20 most common
-  tactics; with `--row-pools` (from `pipeline.py pools`) each row draws from
-  its own GNN top-k ranking — the hard negatives inference presents. The gold
-  sits at a uniformly random index, distractors are redrawn per row, and the
-  option order is reshuffled every epoch — so neither position, ordering, nor
-  distractor identity leaks the answer, and training matches the GNN top-10
-  reranking shape at inference. `outputs/laya_train.stats.json` records the
-  pool, the per-row option counts, the `gold_in_pool`/`gold_inserted`
-  split, and (under `--row-pools`) how many rows matched a per-row pool.
-  Row pools key on the canonicalized `row_index` — `123`, `123.0`, and
-  `" 123 "` are the same key — and rows without a pool silently fall back to
-  the common-tactic draw, counted in the sidecar.
+  state), and refuses to start without a passing `outputs/audit.json`
+  (`pipeline.py audit`; `--skip-audit` overrides). The native `val` split is
+  disjoint by construction, and `--allow-eval-overlap` overrides the
+  per-file check when the overlap is intended.
+- Every training record is a 10-way decision built from the row's **own GNN
+  top-10 ranking** (`pipeline.py pools`, `--row-pools` is required). No
+  distractor pool, no gold insertion, no top-up: rows whose gold sits outside
+  the ranking are skipped (`gold_not_in_pool`), short rankings keep their
+  length, and rows without a pool are skipped (`pool_missing`). The training
+  target is the soft blend `λ·p_gnn + (1−λ)·onehot(gold)` written to
+  `gold.tactic.probabilities` (`--gnn-lambda`, default 0.3). Options are
+  shuffled per row (seeded on `row_index`) and reshuffled every epoch, so
+  neither position, ordering, nor option identity leaks the answer, and
+  training matches the GNN top-10 reranking shape at inference.
+  `outputs/laya_train.stats.json` records the pools file, the per-row option
+  counts, the `gold_in_pool` count, `gnn_lambda`, `target_source`, and the
+  mean soft-target gold mass. Row pools key on the canonicalized `row_index`
+  — `123`, `123.0`, and `" 123 "` are the same key.
 - Every run appends to `outputs/history.jsonl` and writes
   `outputs/environment.json`, so results remain attributable after outputs
   are overwritten.
