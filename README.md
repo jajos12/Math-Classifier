@@ -34,7 +34,7 @@ Math-Classifier/
 ├── evaluation.py      metrics and JSON reports
 ├── comparison.py      pool cache, multi-checkpoint comparison, acceptance, run history
 ├── progress.py        progress bars, heartbeats, and stage banners
-├── pipeline.py        download/audit/pools/split/benchmark CLI
+├── pipeline.py        download/audit/dedup/pools/split/benchmark CLI
 ├── laya_retrain.py    translated training-record preparation and CLI
 ├── laya_trainer.py    built-in laya.train.finetune adapter
 ├── tactic_choose.py   tactic candidate catalog and name validation
@@ -341,12 +341,11 @@ export HF_TOKEN="your-hugging-face-token"
 
 Do not commit the token. The dataset is ignored by `.gitignore`.
 
-### 2. Check the splits for duplicate rows
+### 2. Audit the splits, then dedup train
 
 Training and evaluation are only meaningful if the native
-`train` / `val` / `test` splits share no rows. The audit streams all three
-split files, hashes each row by `row_index` **and** by proof-state content,
-and fails loudly on any overlap:
+`train` / `val` / `test` splits share no proof states. The audit streams all
+three split files and hashes each row's `text_state` content:
 
 ```bash
 python3 pipeline.py audit
@@ -354,21 +353,54 @@ python3 pipeline.py audit
 
 ```text
 audit: jajostrains/Mathlib-Normalized-Sexpr splits train, val, test
-  train  218,727 rows — 218,727 unique row_index, ... unique states, within-split dupes 0 (index) / 0 (state)
-  val      4,157 rows — ...
-  test     4,392 rows — ...
-  train vs val: ok — 0 shared row_index, 0 shared states
-  train vs test: ok — 0 shared row_index, 0 shared states
-  val vs test: ok — 0 shared row_index, 0 shared states
+  train  218,727 rows — ... unique states, within-split dupes ...
+  ...
+  train vs val: DUPLICATES — 28 shared states; 3,985 shared row_index (positional, not duplication)
+    state hash examples: ['02af2f53933358a1', ...]
+  ...
 report: outputs/audit.json
-audit passed: no cross-split duplicate rows
 ```
 
-The exit code is non-zero and `outputs/audit.json` records `passed: false`
-(with example keys) when splits overlap. `laya_retrain.py` reads that file in
-pre-flight and refuses to run without it (`--skip-audit` opts out, with a
-warning that the numbers may be contaminated). Re-run the audit after any
-change to the dataset files.
+Two things are reported per pair, but only one can fail the audit:
+
+- **Shared states** (content hashes) are real contamination — a proof state in
+  both train and test makes every held-out metric meaningless. Any overlap
+  fails the audit with a non-zero exit and `passed: false` in
+  `outputs/audit.json`.
+- **Shared `row_index`** is *never* a failure: the index is positional within
+  each split (it restarts at 0 in every file), so equal numbers are not equal
+  rows. On this dataset the three splits overlap on thousands of indices and
+  only a few dozen states — trust the state count, not the index count.
+
+When the audit fails on shared states, write a cleaned train file with
+`pipeline.py dedup`. It streams the train split, drops every row whose state
+also appears in `val` or `test` (and, by default, repeated states inside
+train, keeping the first), writes the result with the original `row_index`
+values preserved (so pools still match), and then re-audits the deduped file
+— refreshing `outputs/audit.json` so the `laya_retrain.py` gate is satisfied:
+
+```bash
+python3 pipeline.py dedup --out data/train.dedup.parquet
+```
+
+```text
+dedup: train minus states in val, test
+  rows 218,727 — kept 217,092, dropped 49 cross-split + 1,586 within-train duplicates (0 blank states kept)
+deduped train: data/train.dedup.parquet
+  train vs val: 0 shared states
+  train vs test: 0 shared states
+  val vs test: 0 shared states
+audit (deduped): passed
+report: outputs/audit.json
+audit passed: train.dedup.parquet is disjoint from val, test — use it as the laya_retrain dataset
+```
+
+`--keep-within-train-duplicates` restricts the drop to cross-split rows only.
+Train on `data/train.dedup.parquet` from here on — the dropped rows are a few
+tenths of a percent of train and cost nothing measurable. `laya_retrain.py`
+reads `outputs/audit.json` in pre-flight and refuses to run without a passing
+report (`--skip-audit` opts out, with a warning that the numbers may be
+contaminated). Re-run `audit` (and `dedup`) after any change to the dataset.
 
 ### 3. Build the per-row GNN pools
 
@@ -388,9 +420,10 @@ blend (see [How the 10 options are chosen](#how-the-10-options-are-chosen)).
 
 ### 4. Create one parquet input file
 
-`pipeline.py fetch --out` already produced `data/train.parquet` and
-`data/val.parquet`. `laya_retrain.py` accepts parquet, JSONL, JSON, or CSV,
-so point it at whichever file you prefer. The input must contain at least:
+Step 1 produced `data/train.parquet` (raw) and `data/val.parquet`; step 2
+produced the cleaned `data/train.dedup.parquet` — train on that one.
+`laya_retrain.py` accepts parquet, JSONL, JSON, or CSV, so point it at
+whichever file you prefer. The input must contain at least:
 
 ```text
 text_state
@@ -402,7 +435,7 @@ shuffle and matches rows to their `--row-pools` entry (canonicalized, so
 `123`, `123.0`, and `" 123 "` are the same key). Without it, a stable hash of
 the proof state is used instead — but the pools file would then never match,
 so supply `row_index`. If the dataset already exists elsewhere, use its
-actual path instead of `data/train.parquet`; the file is not created by
+actual path instead of `data/train.dedup.parquet`; the file is not created by
 cloning the repo.
 
 ### 5. Prepare and preview the Laya records
@@ -414,7 +447,7 @@ soft label:
 
 ```bash
 python3 laya_retrain.py \
-    data/train.parquet \
+    data/train.dedup.parquet \
     outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl \
     --preview
@@ -427,7 +460,7 @@ audit, then shows what it will train on:
 
 ```text
 === pre-flight checks [+0s] ===
-  audit         : outputs/audit.json passed — no duplicate rows across train/val/test
+  audit         : outputs/audit.json passed — no duplicate states across train/val/test
   row pools     : 218,727 per-row GNN pools from data/train-pools.jsonl
                  : options and scores come from each row's own ranking; rows without a pool are skipped (pool_missing)
   options/record: up to 10 names from the row's ranking (seed 42, shuffled per row, reshuffled every epoch)
@@ -470,11 +503,11 @@ Useful flags for the first run:
 
 ```bash
 # translate only the first 5000 rows (fast smoke run)
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl --limit 5000
 
 # or a reproducible random sample of 5000 rows
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl --sample 5000 --seed 42
 ```
 
@@ -612,7 +645,7 @@ first run should be small:
 
 ```bash
 python3 laya_retrain.py \
-    data/train.parquet \
+    data/train.dedup.parquet \
     outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl \
     --device cuda:1 \
@@ -632,7 +665,7 @@ Drop `--dry-run`, raise `--limit` (or remove it for the full dataset), and set
 
 ```bash
 python3 laya_retrain.py \
-    data/train.parquet \
+    data/train.dedup.parquet \
     outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl \
     --device cuda:1 \
@@ -793,7 +826,8 @@ The important files are:
 
 ```text
 outputs/audit.json                          cross-split duplicate audit (required)
-data/train.parquet                          full train split (native split)
+data/train.parquet                          full train split (native split, raw)
+data/train.dedup.parquet                    train minus cross-split/within-train state dupes (train on this)
 data/val.parquet                            native validation split
 data/train-pools.jsonl                      per-row GNN rankings + scores (train)
 data/val-pools.jsonl                        per-row GNN rankings + scores (val)
@@ -845,16 +879,19 @@ python pipeline.py devices
 
 `validate` proves the parser/graph path works without Torch, PyG, or Laya.
 
-**1. Audit the splits (seconds–minutes, no GPU)**
+**1. Audit the splits, then dedup train (seconds–minutes, no GPU)**
 
 ```bash
 python3 pipeline.py audit
+python3 pipeline.py dedup --out data/train.dedup.parquet
 python3 pipeline.py fetch --split val --out data/val.parquet
 ```
 
-`audit` must print `audit passed` and write `outputs/audit.json`; every later
-`laya_retrain.py` run reads it. A failure means the native splits share rows
-and the numbers would be contaminated — fix the dataset before continuing.
+`audit` fails on shared *proof states* (the only real contamination); shared
+`row_index` values are positional per split and never fail it. `dedup` drops
+the offending train rows, writes `data/train.dedup.parquet`, and refreshes
+`outputs/audit.json` with a passing report — every later `laya_retrain.py`
+run reads that file and trains on the deduped parquet.
 
 **2. Pools (minutes on a GPU, resumable)**
 
@@ -868,7 +905,7 @@ full splits (`--limit` is only the smoke test) before the real preparation.
 **3. Preparation smoke run (seconds)**
 
 ```bash
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl --limit 5000 --preview
 ```
 
@@ -886,7 +923,7 @@ Remove `--limit`, add `--dry-run`, and let it report the item counts and the
 optimizer budget:
 
 ```bash
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl --dry-run
 ```
 
@@ -912,7 +949,7 @@ training has started is the classic way to lose an hour.
 **6. Fine-tune smoke run (minutes on a GPU)**
 
 ```bash
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl \
     --device cuda:1 --limit 5000 \
     --fine-tune --checkpoint-dir outputs/laya-checkpoint-smoke \
@@ -931,7 +968,7 @@ Repeat step 6 without `--limit` and with `--epochs 4`, then let the automatic
 comparison judge the run at the intended measurement size:
 
 ```bash
-python3 laya_retrain.py data/train.parquet outputs/laya_train.jsonl \
+python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --row-pools data/train-pools.jsonl \
     --device cuda:1 \
     --fine-tune --checkpoint-dir outputs/laya-checkpoint \

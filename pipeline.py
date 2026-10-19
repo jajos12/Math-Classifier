@@ -17,8 +17,10 @@ from comparison import (
 )
 from config import ExperimentConfig
 from data import (
+    _split_keys,
     audit_splits,
     combine_shards,
+    dedup_train,
     download_dataset,
     load_dataset,
     pool_row_key,
@@ -56,6 +58,37 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="audit report path (default: outputs/audit.json)",
+    )
+    dedup = subparsers.add_parser(
+        "dedup",
+        help="write a train parquet without cross-split state duplicates, "
+             "then re-audit and refresh outputs/audit.json",
+    )
+    dedup.add_argument("--train-split", default="train", help="split to dedup (default: train)")
+    dedup.add_argument(
+        "--guard-splits",
+        default="val,test",
+        metavar="A,B",
+        help="splits whose states are protected (default: val,test)",
+    )
+    dedup.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="deduplicated train parquet (e.g. data/train.dedup.parquet)",
+    )
+    dedup.add_argument(
+        "--keep-within-train-duplicates",
+        action="store_true",
+        help="only drop cross-split duplicates; keep repeated states inside train",
+    )
+    dedup.add_argument(
+        "--audit-out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="where to write the refreshed audit report (default: outputs/audit.json)",
     )
     fetch = subparsers.add_parser(
         "fetch",
@@ -204,6 +237,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 print(f"cuda:{index}: {torch.cuda.get_device_name(index)}")
     elif args.command == "audit":
         return _cmd_audit(args)
+    elif args.command == "dedup":
+        return _cmd_dedup(args)
     elif args.command == "fetch":
         return _cmd_fetch(args)
     elif args.command == "benchmark":
@@ -418,23 +453,83 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         )
     for pair, entry in report["overlaps"].items():
         left, right = pair.split("|")
-        status = "ok" if not entry["row_index"] and not entry["state"] else "DUPLICATES"
+        status = "ok" if not entry["state"] else "DUPLICATES"
         print(
-            f"  {left} vs {right}: {status} — "
-            f"{entry['row_index']} shared row_index, {entry['state']} shared states"
+            f"  {left} vs {right}: {status} — {entry['state']} shared states; "
+            f"{entry['row_index']} shared row_index (positional, not duplication)"
         )
         if status != "ok":
-            print(f"    row_index examples: {entry['row_index_examples']}")
             print(f"    state hash examples: {entry['state_examples']}")
     print(f"report: {out}")
     if not report["passed"]:
         print(
-            "audit FAILED: the splits share rows, so held-out metrics would be "
-            "contaminated; remove the duplicates before training",
+            "audit FAILED: the splits share proof states, so held-out metrics "
+            "would be contaminated; run `pipeline.py dedup` to write a clean "
+            "train parquet, or fix the dataset before training",
             file=sys.stderr,
         )
         return 1
-    print("audit passed: no cross-split duplicate rows")
+    print("audit passed: no cross-split duplicate states")
+    return 0
+
+
+def _cmd_dedup(args: argparse.Namespace) -> int:
+    """Write a train parquet without cross-split state duplicates, then re-audit."""
+    config = ExperimentConfig()
+    config.prepare_directories()
+    guard_names = [name.strip() for name in args.guard_splits.split(",") if name.strip()]
+    if not guard_names:
+        raise ValueError("--guard-splits needs at least one split name (e.g. val,test)")
+    if args.train_split in guard_names:
+        raise ValueError("--train-split must not appear in --guard-splits")
+
+    train_paths = download_dataset(config.dataset_repo, args.train_split, config.dataset_dir)
+    guard_paths = {
+        name: download_dataset(config.dataset_repo, name, config.dataset_dir)
+        for name in guard_names
+    }
+    guard_hashes: set[str] = set()
+    for paths in guard_paths.values():
+        for path in paths:
+            _, _, digests, _, _ = _split_keys(path)
+            guard_hashes |= digests
+    guard_hashes.discard("")
+
+    summary = dedup_train(
+        train_paths,
+        guard_hashes,
+        args.out,
+        drop_within_train=not args.keep_within_train_duplicates,
+    )
+    print(f"dedup: {args.train_split} minus states in {', '.join(guard_names)}")
+    print(
+        f"  rows {summary['rows']:,} — kept {summary['kept']:,}, "
+        f"dropped {summary['dropped_cross_split']:,} cross-split + "
+        f"{summary['dropped_within_train']:,} within-train duplicates "
+        f"({summary['blank_state_kept']:,} blank states kept)"
+    )
+    print(f"deduped train: {summary['output']}")
+
+    report = audit_splits({args.train_split: [args.out], **guard_paths})
+    report["dedup"] = summary
+    audit_out: Path = args.audit_out or config.resolved_output_dir / "audit.json"
+    audit_out.parent.mkdir(parents=True, exist_ok=True)
+    audit_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    for pair, entry in report["overlaps"].items():
+        left, right = pair.split("|")
+        print(f"  {left} vs {right}: {entry['state']} shared states")
+    print(f"audit (deduped): {'passed' if report['passed'] else 'FAILED'}")
+    print(f"report: {audit_out}")
+    if not report["passed"]:
+        print(
+            "audit FAILED after dedup; inspect the state examples above",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "audit passed: train.dedup.parquet is disjoint from "
+        f"{', '.join(guard_names)} — use it as the laya_retrain dataset"
+    )
     return 0
 
 

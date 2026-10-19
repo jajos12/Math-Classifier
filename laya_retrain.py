@@ -1053,17 +1053,17 @@ def _check_audit(args: argparse.Namespace, config: RetrainConfig) -> None:
         if not report.get("passed"):
             overlaps = report.get("overlaps") or {}
             detail = ", ".join(
-                f"{pair}: {entry.get('row_index', '?')} row_index / "
-                f"{entry.get('state', '?')} state"
+                f"{pair}: {entry.get('state', '?')} shared states"
                 for pair, entry in overlaps.items()
-                if entry.get("row_index") or entry.get("state")
+                if entry.get("state")
             )
             raise ValueError(
-                f"cross-split audit in {path} FAILED ({detail}); remove the "
-                "duplicate rows and rerun `python3 pipeline.py audit`"
+                f"cross-split audit in {path} FAILED ({detail}); run "
+                "`python3 pipeline.py dedup --out data/train.dedup.parquet` "
+                "and train on the deduped file"
             )
         print(
-            f"  audit         : {path} passed — no duplicate rows across "
+            f"  audit         : {path} passed — no duplicate states across "
             "train/val/test"
         )
         return

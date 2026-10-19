@@ -149,11 +149,13 @@ def _split_keys(path: Path) -> tuple[int, set[str], set[str], int, int]:
 def audit_splits(splits: Mapping[str, Sequence[Path]]) -> dict[str, Any]:
     """Check splits for duplicate rows, within and across splits.
 
-    Two identities are checked per split: the canonicalized ``row_index`` and a
-    content hash of ``text_state``. Any overlap *between* splits is reported as
-    a failure with example keys, because a row shared by train and test makes
-    every held-out metric meaningless. Returns the report dict with
-    ``passed`` set accordingly.
+    Contamination is judged on the content hash of ``text_state``: any state
+    shared *between* splits is reported as a failure with example keys,
+    because a row shared by train and test makes every held-out metric
+    meaningless. ``row_index`` overlap between splits is recorded but never
+    fails the audit — the index is positional within each split (it restarts
+    at 0 in every shard), so equal numbers are not equal rows. Returns the
+    report dict with ``passed`` set accordingly.
     """
     per_split: dict[str, dict[str, Any]] = {}
     index_sets: dict[str, set[str]] = {}
@@ -191,10 +193,11 @@ def audit_splits(splits: Mapping[str, Sequence[Path]]) -> dict[str, Any]:
         for right in names[position + 1:]:
             shared_keys = sorted(index_sets[left] & index_sets[right])
             shared_hashes = sorted(hash_sets[left] & hash_sets[right])
-            if shared_keys or shared_hashes:
+            if shared_hashes:
                 passed = False
             overlaps[f"{left}|{right}"] = {
                 "row_index": len(shared_keys),
+                "row_index_note": "row_index is positional within each split; overlap is not duplication",
                 "state": len(shared_hashes),
                 "row_index_examples": shared_keys[:5],
                 "state_examples": shared_hashes[:5],
@@ -204,6 +207,74 @@ def audit_splits(splits: Mapping[str, Sequence[Path]]) -> dict[str, Any]:
         "splits": per_split,
         "overlaps": overlaps,
         "passed": passed,
+    }
+
+
+def dedup_train(
+    train_paths: Sequence[Path],
+    guard_hashes: set[str],
+    output: Path,
+    *,
+    drop_within_train: bool = True,
+) -> dict[str, Any]:
+    """Write a train parquet with cross-split (and optionally within-train) state duplicates removed.
+
+    Rows whose ``state_fingerprint(text_state)`` appears in ``guard_hashes``
+    (the val/test hashes) are dropped; with ``drop_within_train`` a repeated
+    state inside train keeps only its first occurrence. Blank states are
+    always kept — they are unusable rows, not duplicates. The original
+    ``row_index`` values are preserved, so pools computed over the full
+    split still match. Returns a report with dropped/kept counts.
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "dedup needs pyarrow; install it with `pip install pyarrow`"
+        ) from exc
+    if not train_paths:
+        raise ValueError("no train shards to dedup")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    rows = kept = dropped_cross = dropped_within = blank_state = 0
+    writer: Any = None
+    for path in train_paths:
+        file = pq.ParquetFile(path)
+        schema = file.schema_arrow
+        if writer is None:
+            writer = pq.ParquetWriter(output, schema)
+        for batch in file.iter_batches(batch_size=2000):
+            states = batch.column(schema.get_field_index("text_state")).to_pylist()
+            keep: list[int] = []
+            for position, raw_state in enumerate(states):
+                rows += 1
+                digest = state_fingerprint(raw_state)
+                if not digest:
+                    blank_state += 1
+                    keep.append(position)
+                    continue
+                if digest in guard_hashes:
+                    dropped_cross += 1
+                    continue
+                if drop_within_train and digest in seen:
+                    dropped_within += 1
+                    continue
+                seen.add(digest)
+                keep.append(position)
+            kept += len(keep)
+            if keep:
+                writer.write_batch(batch.take(pa.array(keep, type=pa.int64())))
+    if writer is None:
+        raise ValueError("no train shards to dedup")
+    writer.close()
+    return {
+        "output": str(output),
+        "rows": rows,
+        "kept": kept,
+        "dropped_cross_split": dropped_cross,
+        "dropped_within_train": dropped_within,
+        "blank_state_kept": blank_state,
     }
 
 
