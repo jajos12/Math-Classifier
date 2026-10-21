@@ -625,7 +625,8 @@ Each side needs its own pools file (`pipeline.py pools --split ...` scores
 that split's rows), and both sides must use the same `--gnn-lambda`, so the
 held-out metric measures exactly the skill the benchmark measures. The
 pre-flight of every fine-tune run intersects `--eval-data` with the training
-dataset — matched on `row_index`, falling back to the raw proof state — and
+dataset — matched on the raw proof state, falling back to `row_index` only when
+the prepared records do not contain one — and
 refuses to start when they overlap, because an evaluation over its own
 training rows measures memorization. `--allow-eval-overlap` opts out.
 
@@ -1013,8 +1014,9 @@ audit, GPU visibility, missing eval file) without touching the GPU.
   restores fail-fast. Both the counts and one example per reason are written
   to `outputs/laya_train.stats.json`.
 - Fine-tuning refuses an `--eval-data` file whose rows are also in the
-  training dataset (matched on `row_index`, falling back to the raw proof
-  state), and refuses to start without a passing `outputs/audit.json`
+  training dataset (matched on the raw proof state, falling back to
+  `row_index` only when the prepared records do not contain one), and refuses
+  to start without a passing `outputs/audit.json`
   (`pipeline.py audit`; `--skip-audit` overrides). The native `val` split is
   disjoint by construction, and `--allow-eval-overlap` overrides the
   per-file check when the overlap is intended.

@@ -959,8 +959,10 @@ def _check_eval_overlap(
 
     Returns ``(shared, rows, matched on)`` — or ``None`` when the two files
     share no usable key, in which case overlap cannot be determined cheaply.
-    Matching prefers ``row_index`` (cheap, exact) and falls back to the raw
-    proof state, which also catches duplicated rows under different indices.
+    Matching prefers the raw proof state because ``row_index`` is positional
+    within each dataset split and can legitimately repeat across splits. The
+    row index is used only when the prepared evaluation records do not contain
+    a raw proof state.
     """
     rows, ids, states = _load_eval_signatures(eval_path)
     if not rows:
@@ -969,9 +971,6 @@ def _check_eval_overlap(
     if columns is None:
         first = next(iter_rows(dataset_path), None)
         columns = set(first) if isinstance(first, Mapping) else set()
-    if len(ids) == rows and id_column in columns:
-        known = {str(value) for value in _iter_column_values(dataset_path, id_column)}
-        return sum(1 for value in ids if value in known), rows, id_column
     # The dataset column holding the raw proof state: the parquet column for
     # raw datasets, or the ``raw_state`` field when training from prepared records.
     if len(states) == rows:
@@ -982,6 +981,9 @@ def _check_eval_overlap(
                 hash(str(value)) for value in _iter_column_values(dataset_path, column)
             }
             return sum(1 for value in states if value in known), rows, column
+    if len(ids) == rows and id_column in columns:
+        known = {str(value) for value in _iter_column_values(dataset_path, id_column)}
+        return sum(1 for value in ids if value in known), rows, id_column
     return None
 
 
