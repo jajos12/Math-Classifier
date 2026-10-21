@@ -320,14 +320,24 @@ python3 pipeline.py fetch --split val   --out data/val.parquet
 
 `fetch` downloads the parquet shards and concatenates them into the given
 file (default `data/<split>.parquet`); add `--no-combine` to keep the raw
-shards, or combine them yourself:
+shards, and combine them later with `--combine-only`:
+
+```bash
+python3 pipeline.py fetch --split train --no-combine
+python3 pipeline.py fetch --split train --out data/train.parquet --combine-only
+```
+
+The shards live in `data/<owner>--<dataset>/<split>/*.parquet` — the directory
+name is the dataset repo id with `/` replaced by `--`, so for this dataset it
+is `data/jajostrains--Mathlib-Normalized-Sexpr/train/`. To combine them from
+Python instead, use `dataset_shard_paths` so the layout stays in one place:
 
 ```bash
 python3 - <<'PY'
 from pathlib import Path
-from data import combine_shards
+from data import combine_shards, dataset_shard_paths
 
-paths = sorted(Path("data/Mathlib-Normalized-Sexpr").rglob("train/*.parquet"))
+paths = dataset_shard_paths(Path("data/jajostrains--Mathlib-Normalized-Sexpr"), "train")
 output, rows = combine_shards(paths, Path("data/train.parquet"))
 print(f"Wrote {rows} rows to {output}")
 PY

@@ -55,6 +55,29 @@ def download_dataset(repo: str, split: str, directory: Path) -> list[Path]:
     ]
 
 
+def dataset_shard_paths(directory: Path, split: str) -> list[Path]:
+    """Shard files of one split inside a downloaded dataset directory.
+
+    :func:`download_dataset` stores shards as ``<directory>/<split>/*.parquet``,
+    where ``<directory>`` is the dataset repo id with ``/`` replaced by ``--``
+    (see ``ExperimentConfig.dataset_dir``).  This is the single place that
+    knows that layout, so the CLI, the docs, and manual scripts cannot drift
+    apart again.
+    """
+    directory = Path(directory)
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    for path in sorted(directory.rglob(f"{split}/*.parquet")):
+        if not path.is_file():
+            continue
+        key = path.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(path)
+    return paths
+
+
 def load_dataset(paths: list[Path]):
     import pandas as pd
     if not paths:
@@ -79,7 +102,11 @@ def combine_shards(paths: Sequence[Path], output: Path) -> tuple[Path, int]:
     import pandas as pd
 
     if not paths:
-        raise ValueError("no shards to combine")
+        raise ValueError(
+            "no shards to combine; the downloaded shards live in "
+            "data/<owner>--<dataset>/<split>/*.parquet — combine them with "
+            "`python3 pipeline.py fetch --split <split> --out <file>.parquet`"
+        )
     frame = pd.concat([pd.read_parquet(path) for path in paths], ignore_index=True)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

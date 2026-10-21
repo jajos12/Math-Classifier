@@ -20,6 +20,7 @@ from data import (
     _split_keys,
     audit_splits,
     combine_shards,
+    dataset_shard_paths,
     dedup_train,
     download_dataset,
     load_dataset,
@@ -107,6 +108,11 @@ def _parser() -> argparse.ArgumentParser:
         dest="combine",
         action="store_false",
         help="download the shards without combining them into one file",
+    )
+    fetch.add_argument(
+        "--combine-only",
+        action="store_true",
+        help="skip the download and combine the shards already in the dataset directory",
     )
     benchmark = subparsers.add_parser("benchmark", help="run GNN and Laya ranking evaluation")
     benchmark.add_argument("--rows", type=int, default=500, help="number of rows to evaluate")
@@ -537,7 +543,18 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
     """Download one split and optionally combine its shards into one file."""
     config = ExperimentConfig()
     config.prepare_directories()
-    paths = download_dataset(config.dataset_repo, args.split, config.dataset_dir)
+    if args.combine_only:
+        if not args.combine:
+            raise ValueError("--combine-only needs the shards to be combined; drop --no-combine")
+        paths = dataset_shard_paths(config.dataset_dir, args.split)
+        if not paths:
+            raise ValueError(
+                f"no downloaded shards for split {args.split!r} in "
+                f"{config.dataset_dir} — run the same command without "
+                "--combine-only to download them first"
+            )
+    else:
+        paths = download_dataset(config.dataset_repo, args.split, config.dataset_dir)
     for path in paths:
         print(f"shard: {path}")
     if not args.combine:
