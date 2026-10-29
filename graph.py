@@ -256,9 +256,3 @@ def dag_to_pyg(dag: DAGBuilder, vocab: dict[str, int], *, edge_mode: str = "bidi
     )
     data.state_node_index = torch.tensor([root_state_node_index(dag)], dtype=torch.long)
     return data
-
-
-def unknown_label_rate(dag: DAGBuilder, vocab: dict[str, int]) -> float:
-    if not dag.nodes:
-        return 0.0
-    return sum(node.label not in vocab for node in dag.nodes) / len(dag.nodes)

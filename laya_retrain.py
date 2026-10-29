@@ -51,7 +51,7 @@ from laya_adapter import (
 from data import pool_row_key
 from graph import normalize_tactic
 from progress import banner, bar, format_elapsed
-from tactic_choose import TACTIC_SET, validate_tactic_names
+from tactic_choose import TACTIC_SET
 
 LAYA_RETRAIN_INSTRUCTIONS = DEFAULT_INSTRUCTIONS
 PARQUET_CHUNK_ROWS = 2000
@@ -205,8 +205,6 @@ class RowPoolCandidates:
 class RetrainConfig:
     dataset_path: Path
     output_path: Path
-    distractor_pool: tuple[str, ...] = ()
-    distractor_pool_source: str = "dataset"
     row_pools: Mapping[str, tuple[tuple[str, ...], tuple[float, ...]]] = field(
         default_factory=dict
     )
@@ -229,13 +227,6 @@ class RetrainConfig:
         if not (math.isfinite(self.gnn_lambda) and 0.0 <= self.gnn_lambda <= 1.0):
             raise ValueError(
                 f"gnn_lambda must be a finite blend weight in [0, 1], got {self.gnn_lambda!r}"
-            )
-        if self.distractor_pool:
-            # Rejects anything outside the canonical catalog before any work starts.
-            object.__setattr__(
-                self,
-                "distractor_pool",
-                validate_tactic_names(list(self.distractor_pool)),
             )
         if self.device not in {"auto", "cpu", "cuda"} and not (
             self.device.startswith("cuda:") and self.device[5:].isdigit()
@@ -352,8 +343,6 @@ class PrepStats:
             "skip_examples": dict(sorted(self.skip_examples.items())),
             "gold_in_pool": self.gold_in_pool,
             "training_option_counts": counts,
-            "distractor_pool": list(config.distractor_pool) or None,
-            "distractor_pool_source": config.distractor_pool_source,
             "row_pools_source": config.row_pools_source or None,
             "row_pool_rows": len(config.row_pools),
             "row_pool_matched": self.row_pool_matched,
@@ -624,11 +613,6 @@ def iter_rows(path: Path) -> Iterator[dict[str, Any]]:
     raise ValueError(f"Unsupported dataset format: {path.suffix}")
 
 
-def load_rows(path: Path) -> list[dict[str, Any]]:
-    """Load JSONL, JSON, CSV, or parquet rows without converting to graphs."""
-    return list(iter_rows(path))
-
-
 def _sampler_for(config: RetrainConfig) -> RowPoolCandidates:
     """The candidate builder for this run: options and soft target from pools."""
     return RowPoolCandidates(
@@ -714,18 +698,6 @@ def write_stats(stats: PrepStats, config: RetrainConfig) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(stats.to_dict(config), indent=2), encoding="utf-8")
     return path
-
-
-def read_stats(output_path: Path) -> dict[str, Any] | None:
-    """Load the sidecar written by :func:`write_stats`, if it exists."""
-    path = output_path.parent / (output_path.stem + ".stats.json")
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
 
 
 class PreparedRecords(Sequence[Mapping[str, Any]]):
@@ -891,10 +863,10 @@ def _check_eval_data(path: Path) -> None:
             return
 
 
-def _load_eval_signatures(path: Path) -> tuple[int, list[str], list[int]]:
-    """Per-row keys of the eval file: (rows, row_index ids, hashes of raw_state)."""
+def _load_eval_signatures(path: Path) -> tuple[int, list[str], list[str]]:
+    """Per-row keys of the eval file: (rows, row_index ids, digests of raw_state)."""
     ids: list[str] = []
-    states: list[int] = []
+    states: list[str] = []
     rows = 0
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -909,8 +881,14 @@ def _load_eval_signatures(path: Path) -> tuple[int, list[str], list[int]]:
                 ids.append(str(row_index))
             raw_state = record.get("raw_state")
             if isinstance(raw_state, str) and raw_state.strip():
-                states.append(hash(raw_state))
+                states.append(raw_state)
     return rows, ids, states
+
+
+def _digest(text: Any) -> str:
+    """Stable content digest (unlike ``hash()``, which is salted per process)."""
+    cleaned = "" if text is None else str(text).strip()
+    return hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:16] if cleaned else ""
 
 
 def _dataset_columns(path: Path) -> set[str] | None:
@@ -978,9 +956,9 @@ def _check_eval_overlap(
             if column not in columns:
                 continue
             known = {
-                hash(str(value)) for value in _iter_column_values(dataset_path, column)
+                _digest(value) for value in _iter_column_values(dataset_path, column)
             }
-            return sum(1 for value in states if value in known), rows, column
+            return sum(1 for value in states if _digest(value) in known), rows, column
     if len(ids) == rows and id_column in columns:
         known = {str(value) for value in _iter_column_values(dataset_path, id_column)}
         return sum(1 for value in ids if value in known), rows, id_column
@@ -1104,8 +1082,6 @@ def preflight(
         f"{1 - config.gnn_lambda:.2f}·gold → gold.tactic.probabilities "
         f"({TARGET_SOURCE})"
     )
-    if config.distractor_pool_source.startswith("deprecated"):
-        print(f"  distractor pool: {config.distractor_pool_source}")
     if args.eval_data is not None:
         _check_eval_data(args.eval_data)
         print(f"  eval data     : {args.eval_data} ok")
@@ -1253,12 +1229,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("dataset", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument(
-        "--distractor-pool",
-        metavar="POOL",
-        help="deprecated and ignored: options come from each row's GNN ranking "
-             "(--row-pools) and no common distractor pool is used",
-    )
-    parser.add_argument(
         "--row-pools",
         type=Path,
         required=True,
@@ -1346,6 +1316,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="test rows used by the automatic comparison (0 disables it; default 100)",
     )
+    parser.add_argument(
+        "--fusion-alpha",
+        type=float,
+        default=0.5,
+        metavar="A",
+        help="weight of Laya's probabilities in the fused ranking reported by "
+             "the automatic comparison (alpha·log p_laya + (1−alpha)·log p_gnn; "
+             "default 0.5). Sweep it on validation with fuse_eval.py",
+    )
     return parser
 
 
@@ -1371,21 +1350,10 @@ def _run(args: argparse.Namespace) -> int:
             "with `python3 pipeline.py pools --split train "
             "--out data/train-pools.jsonl`"
         )
-    if args.distractor_pool:
-        print(
-            "warning: --distractor-pool is deprecated and ignored; options come "
-            "from each row's GNN ranking (--row-pools) and nothing is drawn "
-            "from a common pool",
-            file=sys.stderr,
-        )
     row_pools = load_row_pools(args.row_pools)
     config = RetrainConfig(
         dataset_path=args.dataset,
         output_path=args.output,
-        distractor_pool=(),
-        distractor_pool_source=(
-            "deprecated --distractor-pool (ignored)" if args.distractor_pool else ""
-        ),
         row_pools=row_pools,
         row_pools_source=str(args.row_pools),
         gnn_lambda=args.gnn_lambda,
@@ -1565,10 +1533,16 @@ def _run_auto_compare(args: argparse.Namespace, config: RetrainConfig, stats: Pr
         device=device,
         laya_device=device,
         laya_mode="standard",
+        fusion_alpha=args.fusion_alpha,
     )
     print(f"  pool: {args.compare_rows} rows of the 'test' split "
           f"(seed 42), GNN top-{experiment.pool_k}")
     print(f"  models: base {experiment.laya_model!r} vs fine-tuned {checkpoint!r}")
+    if args.fusion_alpha is not None:
+        print(
+            f"  fusion: alpha {args.fusion_alpha} "
+            "(log-linear GNN scores × Laya probabilities; sweep it with fuse_eval.py)"
+        )
     report = compare_checkpoints(
         experiment,
         {"base": experiment.laya_model, "finetuned": checkpoint},
@@ -1614,7 +1588,13 @@ def _print_comparison(report: Mapping[str, Any]) -> None:
     acceptance = report.get("acceptance")
     if isinstance(acceptance, dict) and acceptance.get("gates"):
         verdict = "PASS" if acceptance.get("passed") else "FAIL"
-        print(f"\nacceptance ({acceptance.get('rows')} rows): {verdict}")
+        rows_note = ""
+        if acceptance.get("rows_sufficient") is False:
+            rows_note = (
+                f" — only {acceptance.get('rows')} rows, below the "
+                f"{acceptance.get('min_rows', 4000)}-row bar (smoke test, not a verdict)"
+            )
+        print(f"\nacceptance ({acceptance.get('rows')} rows): {verdict}{rows_note}")
         for item in acceptance["gates"]:
             mark = "ok  " if item.get("pass") else "FAIL"
             print(

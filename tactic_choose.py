@@ -1,7 +1,7 @@
 """Canonical tactic-family choices used by the ATP/Laya experiment.
 
-The names mirror the tactic vocabulary and gloss table in ``new_idea.ipynb``.
-They are kept as data so reranking and retraining use the same labels.
+The names mirror the published GNN's tactic vocabulary. They are kept as data
+so reranking and retraining use the same labels.
 """
 
 from __future__ import annotations

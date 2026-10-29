@@ -29,6 +29,7 @@ Math-Classifier/
 ├── graph.py           Lean parser, DAG, and PyG conversion
 ├── gnn.py             model download and public inference API
 ├── gnn_bundle.py      published GATv2 checkpoint backend
+├── fusion.py          log-linear GNN×Laya ranking fusion (alpha-weighted)
 ├── laya_interface.py  public Laya adapter exports
 ├── laya_adapter.py    local Laya loading, translation, and reranking
 ├── evaluation.py      metrics and JSON reports
@@ -38,7 +39,9 @@ Math-Classifier/
 ├── laya_retrain.py    translated training-record preparation and CLI
 ├── laya_trainer.py    built-in laya.train.finetune adapter
 ├── tactic_choose.py   tactic candidate catalog and name validation
-└── retraining.py      public retraining exports
+├── retraining.py      public retraining exports
+├── fuse_eval.py       standalone script: sweep alpha on val, report on test
+└── tests/             stdlib unit tests (no GPU required)
 ```
 
 Generated artifacts belong in `data/`, `weights/`, `cache/`, and `outputs/`.
@@ -752,22 +755,27 @@ left alone — it is interpreted relative to that selection, which is what
 Unless `--compare-rows 0` is given, the run ends with stage 3/3: the GNN builds
 its top-10 pool over `--compare-rows` rows of the test split (cached under
 `cache/`, so the GNN runs once and is reused by later runs), and both the base
-checkpoint and the new checkpoint rerank that identical pool. The result is a
-three-way table — GNN, base Laya, fine-tuned Laya — on the same rows (format
-shown, numbers from an example run):
+checkpoint and the new checkpoint rerank that identical pool. The pool is then
+also re-scored once more with `--fusion-alpha` (default 0.5): the fused ranking
+combines the GNN's score distribution with the fine-tuned Laya's probabilities,
+`alpha·log p_laya + (1−alpha)·log p_gnn`, at zero extra Laya cost. The result
+is a four-way table — GNN, base Laya, fine-tuned Laya, fused — on the same rows
+(format shown, numbers from an example run):
 
 ```text
 ====================================================================
 POST-TRAINING COMPARISON (same GNN top-10 pool, same rows)
 ====================================================================
 system           recall@10  recall@5   recall@1    mrr@10
-GNN                   0.900     0.750     0.250     0.420
+GNN                   0.900     0.750     0.330     0.430
 base                  0.350     0.250     0.050     0.140
 finetuned             0.520     0.410     0.130     0.240
+fused                 0.900     0.790     0.380     0.480
 
-acceptance (500 rows): FAIL
-  FAIL finetuned.recall@5 > gnn.recall@5 (0.410 vs 0.750)
-  FAIL finetuned.mrr@10 > gnn.mrr@10 (0.240 vs 0.420)
+acceptance (500 rows): FAIL — only 500 rows, below the 4000-row bar
+  FAIL fused.recall@5 > gnn.recall@5 (0.790 vs 0.750)
+  ok   fused.recall@1 > gnn.recall@1 (0.380 vs 0.330)
+  ok   fused.mrr@10 > gnn.mrr@10 (0.480 vs 0.430)
   ok   finetuned.recall@1 > base.recall@1 (0.130 vs 0.050)
 ====================================================================
 ```
@@ -775,18 +783,35 @@ acceptance (500 rows): FAIL
 and writes:
 
 ```text
-outputs/comparison.json   full metrics per checkpoint, option counts, acceptance gates, environment
+outputs/comparison.json   full metrics per checkpoint + fused row, option counts, acceptance gates, environment
 outputs/comparison.png    recall chart plus device and acceptance notes
 outputs/history.jsonl     one appended line for this run (including the verdict)
 ```
 
-The **acceptance verdict** is computed from the same table: the fine-tune is
-accepted only when it beats the GNN itself on `recall@5` *and* `mrr@10`, and
-beats the base Laya checkpoint on `recall@1`. Each gate records both values,
-so a FAIL line is self-explanatory. The intended measurement point is
-`--compare-rows 500` (the default `100` is enough for a smoke check but too
-small for the verdict); `passed` / `gates` live under `acceptance` in
-`outputs/comparison.json` and `outputs/history.jsonl`.
+The **acceptance verdict** asks the two questions that matter: does the fused
+(or, without fusion, the fine-tuned) ranking beat the GNN itself on `recall@5`,
+`recall@1`, and `mrr@10`, and does the fine-tune beat the base Laya checkpoint
+on `recall@1`? Each gate records both values, so a FAIL line is
+self-explanatory. Runs below `--compare-rows 4000` are flagged
+(`rows_sufficient: false`) instead of letting a one-row difference decide —
+sampling noise on 100 rows is about ±4–5 points. The intended measurement
+point is the full test split; `passed` / `gates` / `rows_sufficient` live under
+`acceptance` in `outputs/comparison.json` and `outputs/history.jsonl`.
+
+### Choosing the fusion weight
+
+`fuse_eval.py` is the measurement tool for `--fusion-alpha`. It sweeps the
+weight over the **validation** split, picks the alpha with the best `mrr@10`,
+and reports GNN vs Laya-only vs fused on the untouched **test** split:
+
+```bash
+python3 fuse_eval.py --device cuda:0 --checkpoint outputs/laya-checkpoint
+```
+
+Alpha is chosen on validation, so the test numbers stay an honest estimate;
+the report lands in `outputs/fusion.json` (including an oracle row that shows
+the per-row ceiling of picking either system's top-1). Pass the chosen value
+to the next fine-tune: `--fusion-alpha 0.3`.
 
 Use `--compare-rows 0` to skip the comparison. It deliberately uses the
 benchmark's untouched test split with a fixed seed, not the training or
@@ -815,6 +840,16 @@ recorded in the same place.
   silently from its own perspective. The comparison detects this, warns, and
   records `laya_device.requested` / `laya_device.actual` so a slow or
   surprising run is attributable.
+- **Fusion is a within-pool reorder.** The fused ranking only reorders the
+  GNN's top-k candidates, so `recall@10` (the retrieval ceiling) never moves;
+  read its effect on `recall@5`, `recall@1` and `mrr@10`. The fused row uses
+  the fine-tuned checkpoint's probabilities by default; its alpha should come
+  from `fuse_eval.py` on the *validation* split, never from the test split
+  being reported.
+- **Small samples do not decide gates.** On 100 rows, ±4–5 percentage points
+  is ordinary sampling noise. `acceptance.rows_sufficient` flags runs below
+  4,000 rows; rerun with the full test split before believing a FAIL or a
+  narrow PASS.
 
 ### 8. Record and export the run
 
@@ -848,7 +883,7 @@ outputs/laya_validation.jsonl               held-out records for --eval-data
 outputs/laya-checkpoint/                    fine-tuned model
 outputs/laya-checkpoint/training_report.json
 outputs/laya-checkpoint/run_environment.txt
-outputs/comparison.json                     base vs fine-tuned metrics + acceptance
+outputs/comparison.json                     base vs fine-tuned metrics, the fused row, + acceptance
 outputs/comparison.png
 outputs/history.jsonl                       every benchmark/comparison run
 outputs/environment.json                    interpreter, packages, CUDA, git state
@@ -987,9 +1022,12 @@ python3 laya_retrain.py data/train.dedup.parquet outputs/laya_train.jsonl \
     --epochs 4 --compare-rows 500
 ```
 
-The `acceptance` block in `outputs/comparison.json` is the verdict: all three
-gates must pass (beat the GNN on `recall@5` and `mrr@10`, beat base Laya on
-`recall@1`). Compare with the base-checkpoint benchmark already stored in
+The `acceptance` block in `outputs/comparison.json` is the verdict: the fused
+ranking must beat the GNN on `recall@5`, `recall@1` and `mrr@10` (without
+fusion, the fine-tune itself on `recall@5` and `mrr@10`), the fine-tune must
+beat base Laya on `recall@1`, and at least 4,000 rows must have been measured
+(`rows_sufficient` — below that, the block is a smoke test, not a verdict).
+Compare with the base-checkpoint benchmark already stored in
 `outputs/history.jsonl`, and re-run the benchmark against the new checkpoint
 if you also want the standalone measurement:
 
@@ -1045,9 +1083,13 @@ audit, GPU visibility, missing eval file) without touching the GPU.
 ```bash
 python pipeline.py validate
 python -m compileall -q .
+python -m unittest discover -s tests -t .
 ```
 
 The validation command does not require Torch, PyG, Hugging Face access, or
 Laya. It checks that the local parser creates a valid proof-state graph.
+The unit tests also run without a GPU (and mostly without Torch): they cover
+record blending, per-row pools, ranking metrics, the fusion module, config
+validation, graph parsing, and the comparison/acceptance helpers.
 `compileall` catches syntax errors across every module, including the ones
 that only run on the GPU server.

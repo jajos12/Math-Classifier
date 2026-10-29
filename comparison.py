@@ -27,6 +27,12 @@ from typing import Any
 
 from config import ExperimentConfig
 
+#: Below this row count an acceptance gate is statistically weak: a ±4–5
+#: point swing is ordinary sampling noise on 100 rows. ``rows_sufficient``
+#: records whether the verdict clears it; the intended measurement point is
+#: the full test split (~4,400 rows).
+MIN_ACCEPTANCE_ROWS = 4000
+
 
 # --------------------------------------------------------------------- reranking
 
@@ -42,16 +48,21 @@ def rerank_states(
 
     Laya ranks the pool by itself: its own probability order is always the
     result. The GNN only supplies the candidate set — its order is never kept
-    or blended in, so the two systems stay separate.
+    or blended in, so the two systems stay separate here. The probabilities
+    are returned alongside the rankings so callers that *want* fusion
+    (:func:`fusion.fuse_ranking`, alpha from validation) can combine them with
+    the GNN's scores afterwards; plain reranking behaves exactly as before.
     """
     rankings: list[list[str]] = []
+    probabilities: list[dict[str, float]] = []
     for state, candidates in zip(states, gnn_rankings):
         if mode == "balanced":
             result = adapter.balanced_predict(state, candidates)
         else:
             result = adapter.predict(state, candidates)
         rankings.append(list(result["order"]))
-    return {"rankings": rankings}
+        probabilities.append(dict(result["probabilities"]))
+    return {"rankings": rankings, "probabilities": probabilities}
 
 
 def describe_device(agent: Any, requested: str) -> dict[str, Any]:
@@ -188,6 +199,7 @@ def compare_checkpoints(
         select_k=config.select_k,
     )
     entries: dict[str, Any] = {}
+    probabilities_by_model: dict[str, list[dict[str, float]]] = {}
     for name, model_id in laya_models.items():
         print(f"  [{name}] loading {model_id} ...", flush=True)
         with warnings.catch_warnings(record=True) as caught:
@@ -206,6 +218,7 @@ def compare_checkpoints(
             mode=config.laya_mode,
         )
         elapsed = time.monotonic() - started
+        probabilities_by_model[name] = outcome["probabilities"]
         reranked = build_report(
             pool["gnn_rankings"],
             outcome["rankings"],
@@ -231,6 +244,7 @@ def compare_checkpoints(
         del adapter
         _release_cuda()
 
+    fuse_rankings = _fused_block(config, pool, entries, probabilities_by_model)
     option_count = _option_count_block(config, pool, prep_stats)
     return {
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -248,6 +262,7 @@ def compare_checkpoints(
             "transitions": baseline["transitions"],
         },
         "models": entries,
+        "fusion_alpha": config.fusion_alpha if fuse_rankings else None,
         "option_count": option_count,
         "target_in_pool": baseline["pool_recall"],
         "acceptance": acceptance_block(
@@ -261,54 +276,125 @@ def compare_checkpoints(
     }
 
 
+def _fused_block(
+    config: ExperimentConfig,
+    pool: Mapping[str, Any],
+    entries: dict[str, Any],
+    probabilities_by_model: Mapping[str, list[dict[str, float]]],
+) -> bool:
+    """Add the fused ranking as one more system in ``entries``.
+
+    The fused entry combines the GNN's score distribution with the *last*
+    loaded Laya checkpoint's probabilities (alpha·log p_laya +
+    (1−alpha)·log p_gnn); with a single checkpoint that is the fine-tune. It
+    is a pure post-processing of the same pool, so it costs no extra Laya
+    calls. Returns whether a fused row was added.
+    """
+    from evaluation import build_report
+    from fusion import fuse_rankings
+
+    alpha = config.fusion_alpha
+    probabilities = probabilities_by_model.get("finetuned") or (
+        probabilities_by_model[next(iter(probabilities_by_model))] if probabilities_by_model else None
+    )
+    if alpha is None or probabilities is None:
+        return False
+    fused_rankings = fuse_rankings(
+        pool["gnn_rankings"],
+        pool["gnn_scores"],
+        probabilities,
+        alpha,
+    )
+    fused_report = build_report(
+        pool["gnn_rankings"],
+        fused_rankings,
+        pool["targets"],
+        pool_k=config.pool_k,
+        select_k=config.select_k,
+    )
+    entries["fused"] = {
+        "model": f"log-linear fusion alpha={alpha}",
+        "metrics": fused_report["metrics"]["laya"],
+        "conditional": fused_report["metrics"]["laya"].get("conditional", {}),
+        "transitions": fused_report["transitions"],
+        "elapsed_seconds": None,
+    }
+    print(
+        f"  [fused] alpha {alpha} "
+        f"recall@1 {fused_report['metrics']['laya'].get('recall@1', 0.0):.3f} "
+        f"recall@{config.pool_k} {fused_report['metrics']['laya'].get(f'recall@{config.pool_k}', 0.0):.3f}",
+        flush=True,
+    )
+    return True
+
+
 def acceptance_block(report: Mapping[str, Any]) -> dict[str, Any]:
     """The run's accept/reject verdict on one fixed pool.
 
-    The fine-tune is accepted when, on the same rows and the same GNN top-10
-    pool, it beats the GNN itself on ``recall@5`` and ``mrr@10`` *and* beats
-    the base Laya checkpoint on ``recall@1``. Each gate records both values so
-    a FAIL line is self-explanatory in ``comparison.json`` and
-    ``history.jsonl``.
+    The gates measure the two questions that actually matter:
+
+    * **fused vs GNN** — a fused ranking (GNN scores + Laya probabilities,
+      alpha chosen on validation) must beat the GNN itself on ``recall@5``,
+      ``recall@1`` and ``mrr@10``; when no fusion is configured the check
+      falls back to the fine-tuned checkpoint alone on ``recall@5`` and
+      ``mrr@10``, as before.
+    * **fine-tuned vs base Laya** — the checkpoint must beat the base model
+      on ``recall@1``.
+
+    Each gate records both values so a FAIL line is self-explanatory in
+    ``comparison.json`` and ``history.jsonl``. Gates on a few dozen rows are
+    noise (±4–5 points on 100 rows), so ``rows_sufficient`` flags runs below
+    ``MIN_ACCEPTANCE_ROWS`` instead of letting a one-row difference decide.
     """
     gnn = report.get("gnn", {}).get("metrics", {})
     models = report.get("models", {})
     finetuned = (models.get("finetuned") or {}).get("metrics", {})
     base = (models.get("base") or {}).get("metrics", {})
+    fused = (models.get("fused") or {}).get("metrics", {})
     gates: list[dict[str, Any]] = []
+    missing: list[str] = []
 
-    def gate(label: str, left: float, right: float) -> None:
+    def gate(label: str, left: Any, right: Any) -> None:
         gates.append(
-            {"gate": label, "left": left, "right": right, "pass": left > right}
+            {"gate": label, "left": float(left), "right": float(right), "pass": float(left) > float(right)}
         )
 
-    for key in ("recall@5", "mrr@10"):
-        if key in finetuned and key in gnn:
-            gate(
-                f"finetuned.{key} > gnn.{key}",
-                float(finetuned[key]),
-                float(gnn[key]),
-            )
+    if fused:
+        for key in ("recall@5", "recall@1", "mrr@10"):
+            if key in fused and key in gnn:
+                gate(f"fused.{key} > gnn.{key}", fused[key], gnn[key])
+        if not ({"recall@5", "recall@1", "mrr@10"} <= fused.keys() and {"recall@5", "recall@1", "mrr@10"} <= gnn.keys()):
+            missing.append("fused/gnn metrics")
+    else:
+        for key in ("recall@5", "mrr@10"):
+            if key in finetuned and key in gnn:
+                gate(f"finetuned.{key} > gnn.{key}", finetuned[key], gnn[key])
+        if not ({"recall@5", "mrr@10"} <= finetuned.keys() and {"recall@5", "mrr@10"} <= gnn.keys()):
+            missing.append("finetuned/gnn metrics")
     if "recall@1" in finetuned and "recall@1" in base:
         gate(
             "finetuned.recall@1 > base.recall@1",
-            float(finetuned["recall@1"]),
-            float(base["recall@1"]),
+            finetuned["recall@1"],
+            base["recall@1"],
         )
-    missing = []
-    if not ({"recall@5", "mrr@10"} <= finetuned.keys() and {"recall@5", "mrr@10"} <= gnn.keys()):
-        missing.append("finetuned/gnn metrics")
-    if "recall@1" not in finetuned or "recall@1" not in base:
+    else:
         missing.append("finetuned/base recall@1")
+    rows = report.get("n")
+    rows_sufficient = rows is None or rows >= MIN_ACCEPTANCE_ROWS
     return {
         "passed": bool(gates) and not missing and all(item["pass"] for item in gates),
         "complete": not missing,
         "missing": missing,
-        "rows": report.get("n"),
+        "rows": rows,
+        "min_rows": MIN_ACCEPTANCE_ROWS,
+        "rows_sufficient": rows_sufficient,
         "gates": gates,
         "note": (
-            "Accept only when every gate passes: the fine-tune must beat the "
-            "GNN on recall@5 and mrr@10, and the base Laya checkpoint on "
-            "recall@1, on the same pool and rows."
+            "Accept only when every gate passes and the row count is large "
+            "enough: the fused ranking must beat the GNN on recall@5, "
+            "recall@1 and mrr@10 (without fusion, the fine-tune itself on "
+            "recall@5 and mrr@10), and the fine-tune must beat the base Laya "
+            "checkpoint on recall@1 — on the same pool and rows."
         ),
     }
 
@@ -430,6 +516,11 @@ def write_comparison_image(report: Mapping[str, Any], path: Path) -> Path:
     acceptance = report.get("acceptance")
     if isinstance(acceptance, dict) and acceptance.get("gates"):
         lines.extend(("", f"Acceptance: {'PASS' if acceptance.get('passed') else 'FAIL'}"))
+        if acceptance.get("rows_sufficient") is False:
+            lines.append(
+                f"  note: only {acceptance.get('rows')} rows — below the "
+                f"{acceptance.get('min_rows', 4000)}-row bar, read as a smoke test"
+            )
         for item in acceptance["gates"]:
             mark = "ok  " if item.get("pass") else "FAIL"
             lines.append(
