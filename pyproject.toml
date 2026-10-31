@@ -12,11 +12,13 @@ dependencies = [
   "pandas",
   "pyarrow",
   "huggingface_hub",
+  "matplotlib",
+  "tqdm",
 ]
 
 [tool.setuptools]
 py-modules = [
-  "config", "data", "evaluation", "gnn", "gnn_bundle", "graph",
-  "laya_interface", "laya_adapter", "laya_retrain", "pipeline", "retraining",
-  "tactic_choose",
+  "comparison", "config", "data", "evaluation", "fusion", "fuse_eval", "gnn",
+  "gnn_bundle", "graph", "laya_interface", "laya_adapter", "laya_retrain",
+  "pipeline", "progress", "retraining", "laya_trainer", "tactic_choose",
 ]

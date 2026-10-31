@@ -15,17 +15,29 @@ from tactic_choose import TACTIC_SET
 
 DEFAULT_GLOSS = "a Lean 4 tactic family; choose it only when its name matches the proof step"
 DEFAULT_INSTRUCTIONS = (
-    "Analyze the Lean proof state and determine which proof action is most useful next. "
-    "Use the current goal together with the local hypotheses: look for hypotheses that "
-    "can be applied, rewritten, simplified, destructured, or used in arithmetic. "
-    "Consider the candidate tactic descriptions as hints about the actions they perform, "
-    "then rank the available actions by how well they fit this particular state."
+    "This is a multiple-choice question about a Lean 4 proof: from the candidate "
+    "tactics listed with this state, pick the one that is the correct next tactic. "
+    "Read the state as a whole first — the goal says what still has to be proved, "
+    "and the local hypotheses say what you have to work with: a fact to rewrite "
+    "with, apply, simplify, case-split, or feed to arithmetic. Every candidate "
+    "comes with a short description of what that tactic does; use it to picture "
+    "what would actually happen if you ran the tactic on this exact state. Cross "
+    "out the options that cannot apply here, would leave the goal unchanged, or "
+    "head in a different direction, and keep the ones that make concrete progress "
+    "toward the goal as written — if several still fit, prefer the one that uses "
+    "the hypotheses most directly. "
+    "Answer with a probability for every candidate: how likely each one is to be "
+    "the correct choice, with the values summing to 1 across the list. These "
+    "numbers express how confident you are in the right answer, not how useful you "
+    "find an option — a hesitant question spreads its probability out, a clear one "
+    "concentrates it."
 )
 TACTIC_GLOSS: dict[str, str] = {
     ".": "move on to the next goal in the list",
     "apply": "apply a lemma or hypothesis to the goal",
     "assumption": "close the goal with a matching hypothesis",
     "cases": "destruct a value into its constructors",
+    "cases'": "destruct a value into its constructors with custom names",
     "constructor": "apply the goal's first constructor",
     "exact": "close the goal with an exact term",
     "intro": "introduce a binder or hypothesis",
@@ -53,7 +65,7 @@ TACTIC_GLOSS: dict[str, str] = {
     "funext": "prove function equality by proving equality for every input",
     "have": "introduce an intermediate proposition or local fact",
     "induction": "split the proof using an induction principle",
-    "intro": "introduce a quantified variable or implication hypothesis",
+    "induction'": "apply an explicit induction principle with custom naming",
     "norm_num": "normalize and prove concrete numerical arithmetic",
     "omega": "solve Presburger arithmetic over natural or integer variables",
     "positivity": "prove that an expression is positive or nonnegative",
@@ -62,10 +74,41 @@ TACTIC_GLOSS: dict[str, str] = {
     "simp_all": "simplify the goal and all local hypotheses",
     "solve_by_elim": "close the goal by applying matching local hypotheses",
     "split": "split a conjunction, structure, or equivalent goal",
+    "split_ifs": "split the goal at its if-then-else condition points",
     "subst": "replace a variable using an equality hypothesis",
     "tauto": "solve a propositional-logic goal",
     "unfold": "unfold a named definition",
     "use": "supply a witness or explicit term for the goal",
+    # --- tactics whose candidates previously fell back to the circular
+    # --- description "use the Lean tactic family 'x'"; the glosses below are
+    # --- what translate_tactic_step uses instead.
+    "all_goals": "apply the given tactic to every remaining goal",
+    "contradiction": "close the goal by finding a contradiction in the hypotheses",
+    "convert": "change the goal to a related statement, deferring equality mismatches as side goals",
+    "congr": "reduce the goal to equalities between corresponding parts",
+    "done": "declare the remaining goals solved",
+    "erw": "rewrite with weaker congruence matching than rw",
+    "exacts": "close each remaining goal with the matching exact term in order",
+    "gcongr": "prove a congruence goal by reducing it to arithmetic side conditions",
+    "interval_cases": "case-split a numeric variable over the intervals it can lie in",
+    "left": "reduce a disjunction goal to its left disjunct",
+    "linear_combination": "close the goal as a linear combination of given equalities",
+    "nth_rw": "rewrite using only the nth match of the given lemma within the goal",
+    "obtain": "destruct a hypothesis into named components (rcases-style introduction)",
+    "push_cast": "push casts down into expressions toward normalized forms",
+    "push_neg": "push negations inward through the goal",
+    "norm_cast": "normalize numeric casts between Nat, Int and Real across the goal",
+    "right": "reduce a disjunction goal to its right disjunct",
+    "rintro": "introduce binders from the goal, destructuring patterns as they appear",
+    "rwa": "rewrite with the given equation and then close the goal by reflexivity",
+    "set": "introduce a local definition for an expression, with the defining equality as a hypothesis",
+    "show": "change the goal to a provably equal statement",
+    "simp_rw": "repeatedly rewrite using simp lemmas",
+    "specialize": "instantiate a universally quantified hypothesis with specific values",
+    "suffices": "replace the goal with a sufficient new goal, keeping the original as a side goal",
+    "symm": "apply symmetry to the goal, e.g. turn a = b into b = a",
+    "trivial": "close an obviously true goal",
+    "intros": "introduce all remaining binders of the goal as local hypotheses",
 }
 
 

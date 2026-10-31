@@ -1,3 +1,4 @@
 # Install this file with --no-deps after installing a compatible torch build.
 # This prevents pip from replacing an existing CUDA/CPU Torch installation.
-laya==0.3.23
+# laya.train.finetune was added after 0.3.23.
+laya>=0.3.28,<0.5

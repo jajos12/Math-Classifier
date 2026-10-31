@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
+
+from laya_adapter import DEFAULT_INSTRUCTIONS
 
 
 @dataclass(frozen=True)
@@ -18,25 +21,20 @@ class ExperimentConfig:
     select_k: int = 5
     batch_size: int = 64
     laya_model: str = "convaiinnovations/laya"
-    laya_instructions: str = (
-        "Analyze the Lean proof state and determine which proof action is most useful next. "
-        "Use the current goal together with the local hypotheses: look for hypotheses that "
-        "can be applied, rewritten, simplified, destructured, or used in arithmetic. "
-        "Consider the candidate tactic descriptions as hints about the actions they perform, "
-        "then rank the available actions by how well they fit this particular state."
-    )
-    checkpoint_every: int = 50
+    # One prompt for training and inference: Laya is asked to choose the best
+    # tactic, not to rank candidates, and its distribution is its confidence.
+    laya_instructions: str = DEFAULT_INSTRUCTIONS
     work_dir: Path = field(default_factory=Path.cwd)
     cache_dir: Path | None = None
     output_dir: Path | None = None
     device: str = "auto"
     laya_device: str = "auto"
     laya_mode: str = "standard"
-    laya_confidence_threshold: float = 0.0
-    run_b1: bool = False
-    run_b2: bool = False
-    run_multilingual: bool = False
-    export_laya: bool = False
+    # Weight of Laya's probabilities in the fused ranking
+    # (alpha·log p_laya + (1−alpha)·log p_gnn) computed by compare_checkpoints;
+    # None disables the fused row. Choose the value on validation
+    # (fuse_eval.py), not on the measured split.
+    fusion_alpha: float | None = 0.5
 
     def __post_init__(self) -> None:
         if self.n_rows < 1:
@@ -45,14 +43,19 @@ class ExperimentConfig:
             raise ValueError("pool_k must be positive")
         if self.select_k < 1 or self.select_k > self.pool_k:
             raise ValueError("select_k must be between 1 and pool_k")
-        if self.batch_size < 1 or self.checkpoint_every < 1:
-            raise ValueError("batch_size and checkpoint_every must be positive")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be positive")
         self._validate_device(self.device, "device")
         self._validate_device(self.laya_device, "laya-device")
         if self.laya_mode not in {"standard", "balanced"}:
             raise ValueError("laya-mode must be standard or balanced")
-        if not 0.0 <= self.laya_confidence_threshold <= 1.0:
-            raise ValueError("laya-confidence-threshold must be between 0 and 1")
+        if self.fusion_alpha is not None and not (
+            math.isfinite(self.fusion_alpha) and 0.0 <= self.fusion_alpha <= 1.0
+        ):
+            raise ValueError(
+                "fusion_alpha must be None or a finite weight in [0, 1], "
+                f"got {self.fusion_alpha!r}"
+            )
 
     @staticmethod
     def _validate_device(value: str, name: str) -> None:
@@ -104,7 +107,3 @@ class ExperimentConfig:
     def prepare_directories(self) -> None:
         for path in (self.model_dir, self.dataset_dir, self.resolved_cache_dir, self.resolved_output_dir):
             path.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def cache_path(self) -> Path:
-        return self.resolved_cache_dir / f"{self.split}_{self.n_rows}_seed{self.seed}_k{self.pool_k}.json"
